@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+# per-machine Claude Code permissions (absolute paths, local commands)
+.claude/settings.local.json
+# temporary old-name forwarders, removed by `tokensaver-cli migrate`
+/everytoken
+/everytoken-*
+# working notes for Claude, kept local
+CLAUDE.md

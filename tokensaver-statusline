@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Claude Code status line wrapper: the user's own status line, then a small
+# TokenSaver badge. Installed by `tokensaver setup` (with consent); the
+# original command is kept in ~/.tokensaver/statusline-orig and put back by
+# `tokensaver uninstall`.
+#
+# Badge, only in sessions that go through the proxy:
+#   ⚡18%       default proxy healthy; the % is what sending now would save
+#                       (the proxy's estimate: forward passes and compaction in
+#                       force, plus a ready compaction once the pause is long
+#                       enough), and it can still grow if you wait
+#   ⚡18%       green   the same, and nothing left that waiting would improve
+#   ⚡          default healthy, no estimate for this session yet
+#   ⚡0%        default rewriting stopped by the automatic fallback (nothing saved)
+#   ⚡down      red     proxy not answering
+# Other sessions show nothing extra. Nothing here may break the user's line:
+# every step falls back to printing what the original command printed.
+
+input=$(cat)
+# Data folder and env names: see tokensaver/names.py (renamed from everytoken
+# 2026-10-23; the old folder and EVERYTOKEN_* names hold until `migrate`).
+if [ -n "${TOKENSAVER_HOME:-${EVERYTOKEN_HOME:-}}" ]; then HOME_DIR="${TOKENSAVER_HOME:-$EVERYTOKEN_HOME}"
+elif [ -e "$HOME/.tokensaver/.migrated" ]; then HOME_DIR="$HOME/.tokensaver"
+elif [ -d "$HOME/.everytoken" ] && [ ! -L "$HOME/.everytoken" ]; then HOME_DIR="$HOME/.everytoken"
+else HOME_DIR="$HOME/.tokensaver"; fi
+ORIG_FILE="$HOME_DIR/statusline-orig"
+
+line=""
+if [ -s "$ORIG_FILE" ]; then
+  line=$(printf '%s' "$input" | bash -c "$(cat "$ORIG_FILE")" 2>/dev/null)
+fi
+
+badge=""
+port="${TOKENSAVER_PROXY_PORT:-${EVERYTOKEN_PROXY_PORT:-8787}}"
+case "${ANTHROPIC_BASE_URL:-}" in
+  *127.0.0.1:"$port"*|*localhost:"$port"*)
+    cache="${TMPDIR:-/tmp}/tokensaver-health-$(id -u)-$port"
+    now=$(date +%s)
+    age=999
+    [ -f "$cache" ] && age=$(( now - $(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    if [ "$age" -gt 10 ]; then
+      { curl -fsS --max-time 0.3 "http://127.0.0.1:$port/_tokensaver/health" \
+          || curl -fsS --max-time 0.3 "http://127.0.0.1:$port/_everytoken/health"; } > "$cache.tmp" 2>/dev/null \
+        && mv "$cache.tmp" "$cache" || { rm -f "$cache.tmp"; : > "$cache"; }
+    fi
+    h=$(cat "$cache" 2>/dev/null)
+    if [ -z "$h" ]; then
+      badge="\033[31m⚡down\033[0m"
+    elif printf '%s' "$h" | grep -q '"fallback": true' || printf '%s' "$h" | grep -q '"rewrite": "off"'; then
+      badge="⚡0%"
+    else
+      pct=""
+      scache=/dev/null
+      sid=$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([A-Za-z0-9-]*\)".*/\1/p' | head -1)
+      # Only a proxy that serves the estimate is asked (an older one would
+      # relay the unknown path to the API).
+      if [ -n "$sid" ] && printf '%s' "$h" | grep -q '"estimate": true'; then
+        scache="${TMPDIR:-/tmp}/tokensaver-est-$(id -u)-$sid"
+        sage=999
+        [ -f "$scache" ] && sage=$(( now - $(stat -f %m "$scache" 2>/dev/null || stat -c %Y "$scache" 2>/dev/null || echo 0) ))
+        if [ "$sage" -gt 5 ]; then
+          { curl -fsS --max-time 0.3 "http://127.0.0.1:$port/_tokensaver/session/$sid" \
+              || curl -fsS --max-time 0.3 "http://127.0.0.1:$port/_everytoken/session/$sid"; } > "$scache.tmp" 2>/dev/null \
+            && mv "$scache.tmp" "$scache" || { rm -f "$scache.tmp"; : > "$scache"; }
+        fi
+        pct=$(sed -n 's/.*"pct"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]*\).*/\1/p' "$scache" 2>/dev/null | head -1)
+      fi
+      if [ -n "$pct" ] && grep -q '"done": true' "$scache" 2>/dev/null; then
+        badge="\033[32m⚡${pct}%\033[0m"
+      elif [ -n "$pct" ]; then
+        badge="⚡${pct}%"
+      else
+        badge="⚡"
+      fi
+    fi
+    ;;
+esac
+
+if [ -n "$badge" ]; then
+  printf '%s  %b' "$line" "$badge"
+else
+  printf '%s' "$line"
+fi

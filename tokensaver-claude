@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Claude Code through the TokenSaver proxy when it is up, plain Claude Code
+# when it is not. The proxy sits in the data path and cannot fail open on its
+# own, so this does it: a down proxy must never cost a session.
+#
+#   tokensaver-claude [claude args...]     drop-in for `claude`
+#
+# Starts the proxy in the background if it is not answering (opt out with
+# TOKENSAVER_AUTOSTART=0), with forward rewriting and background compaction
+# unless TOKENSAVER_PROXY_REWRITE / TOKENSAVER_BG_COMPACT say otherwise.
+# TOKENSAVER_DISABLE=1 skips the proxy entirely.
+# Note: if the proxy dies mid-session, that session cannot reach the API
+# until it is restarted; this check only runs at launch.
+
+# Data folder and env names: see tokensaver/names.py (renamed from everytoken
+# 2026-10-23; the old folder and EVERYTOKEN_* names hold until `migrate`).
+if [ -n "${TOKENSAVER_HOME:-${EVERYTOKEN_HOME:-}}" ]; then HOME_DIR="${TOKENSAVER_HOME:-$EVERYTOKEN_HOME}"
+elif [ -e "$HOME/.tokensaver/.migrated" ]; then HOME_DIR="$HOME/.tokensaver"
+elif [ -d "$HOME/.everytoken" ] && [ ! -L "$HOME/.everytoken" ]; then HOME_DIR="$HOME/.everytoken"
+else HOME_DIR="$HOME/.tokensaver"; fi
+PORT="${TOKENSAVER_PROXY_PORT:-${EVERYTOKEN_PROXY_PORT:-8787}}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+URL="http://127.0.0.1:$PORT"
+
+# _everytoken: a proxy started before the rename (2026-10-23)
+healthy() { curl -fsS --max-time 1 "$URL/_tokensaver/health" >/dev/null 2>&1 \
+            || curl -fsS --max-time 1 "$URL/_everytoken/health" >/dev/null 2>&1; }
+
+LABEL=com.tokensaver.proxy
+[ -f "$HOME/Library/LaunchAgents/$LABEL.plist" ] || LABEL=com.everytoken.proxy   # not migrated yet
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+if [ "${TOKENSAVER_DISABLE:-${EVERYTOKEN_DISABLE:-}}" != "1" ]; then
+  if ! healthy && [ -f "$PLIST" ] && command -v launchctl >/dev/null; then
+    # Installed as a service: ask launchd, never start a second copy beside it.
+    launchctl kickstart "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+    for _ in $(seq 1 20); do healthy && break; sleep 0.1; done
+  elif ! healthy && [ "${TOKENSAVER_AUTOSTART:-${EVERYTOKEN_AUTOSTART:-1}}" = "1" ]; then
+    mkdir -p "$HOME_DIR"
+    TOKENSAVER_PROXY_REWRITE="${TOKENSAVER_PROXY_REWRITE:-forward}" \
+    TOKENSAVER_BG_COMPACT="${TOKENSAVER_BG_COMPACT:-1}" \
+      nohup "$HERE/tokensaver-cli" proxy >>"$HOME_DIR/proxy.log" 2>&1 &
+    for _ in $(seq 1 20); do healthy && break; sleep 0.1; done
+  fi
+  if healthy; then
+    # Claude Code switches tool search off (every tool sent in full, ~30K
+    # tokens per request measured) when the base URL is not Anthropic's. The
+    # proxy relays tool_reference blocks byte for byte, so turn it back on,
+    # unless the user chose otherwise.
+    export ANTHROPIC_BASE_URL="$URL" CLAUDE_CODE_GATEWAY_HINT_HEADERS=1
+    export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-true}"
+  else
+    echo "TokenSaver: proxy not answering on $URL; starting Claude Code directly" >&2
+  fi
+fi
+exec claude "$@"
