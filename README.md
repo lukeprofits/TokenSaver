@@ -21,11 +21,21 @@ Measured on 51 real Claude Code sessions (one developer, mostly Opus):
 |---|---|---|
 | tokens sent | 100% | **71%** (29% fewer) |
 | bill | 100% | **77%** (23% cheaper) |
-| bill, long sessions (200+ messages) | 100% | 73% (27% cheaper) |
-| bill, medium sessions (50–199) | 100% | 93% (7% cheaper) |
-| bill, short sessions (under 50) | 100% | about the same |
+| bill, big working sessions | 100% | 73% (27% cheaper) |
+| bill, medium sessions | 100% | 93% (7% cheaper) |
+| bill, quick questions | 100% | about the same |
 
-Long sessions with breaks in them save the most. Want your own number first?
+Session sizes here count every request Claude Code makes, and it makes one
+for each step: every file it reads, command it runs and edit it makes. So one
+message from you is often several requests.
+
+- **Big working sessions** are 200+ requests: typically 30–40 of your own
+  messages of real coding work, often spread over a day with breaks.
+- **Medium sessions** are 50–199 requests.
+- **Quick questions** are under 50 requests, usually just one or two
+  messages.
+
+Big sessions with breaks in them save the most. Want your own number first?
 This replays the Claude Code sessions already on your computer and changes
 nothing:
 
@@ -62,9 +72,11 @@ tokensaver uninstall     # remove it completely
 
 ## How it works
 
-Every time you send Claude a message, Claude Code sends **the whole
-conversation** again: every file Claude read, every command output, everything
-said so far. In a long session that's most of your bill.
+Every time Claude Code talks to Claude, it sends **the whole conversation**
+again: every file Claude read, every command output, everything said so far.
+And it talks to Claude a lot: once for your message, then again after every
+file it reads, command it runs or edit it makes. In a long session, resending
+all that is most of your bill.
 
 Anthropic gives a big discount for resending exactly what it has seen in the
 last hour (this is called the cache). So you can't just trim the conversation
@@ -99,7 +111,7 @@ loses nothing.
 
 | what it does | needs | typical saving |
 |---|---|---|
-| **Cleanup.** The older part of the conversation is replaced with a tighter copy: everything you and Claude wrote is kept word for word; old command output and file views are cut to their first lines plus anything Claude referred to later; the most recent part stays exactly as it was | nothing, any computer | messages after it are ~39% smaller; sessions with several breaks ~30% cheaper |
+| **Cleanup.** The older part of the conversation is replaced with a tighter copy: everything you and Claude wrote is kept word for word; old command output and file views are cut to their first lines plus anything Claude referred to later; the most recent part stays exactly as it was | nothing, any computer | every request after it is ~39% smaller; big sessions with several breaks ~30% cheaper |
 | **Short names for long paths.** Long folder paths that repeat a lot get a short name, only when that actually saves tokens | nothing | 0–2%, often skipped |
 | **Drop replaced pieces.** A small local AI model finds pieces that later work replaced (an old view of a file that was then edited, an attempt that was redone) | a local model, 24 GB+ memory | ~4% more |
 | **Drop repeated pieces.** A larger local model finds things that were said again later | a larger local model, 48 GB+ Mac | ~3% more |
