@@ -87,9 +87,14 @@ of steps:
 1. **On every message, it tidies only what's new**, before Claude sees it for
    the first time. Nothing Claude already saw changes, so the discount stays.
 2. **When you take a long break**, long enough that the discount would expire
-   anyway, it cleans up the older part of the conversation. Resending costs
-   the same at that moment either way, so the cleanup is free and every message
-   after it is smaller.
+   anyway, it trims old command output and file contents in the older part of
+   the conversation. Resending costs the same at that moment either way, so the
+   trimming is free and every request after it is smaller.
+
+The break-time trimming is not Claude Code's `/compact`. It uses no AI and
+costs nothing: it's fixed rules, like the every-message ones, that keep your
+words and Claude's as written and cut down the bulky output Claude already
+dealt with. Claude Code's own `/compact` still works as usual.
 
 It's a small helper program on your own computer, sitting between Claude Code
 and Anthropic. It doesn't use an AI model or an API key of its own.
@@ -111,15 +116,17 @@ loses nothing.
 
 | what it does | needs | typical saving |
 |---|---|---|
-| **Cleanup.** The older part of the conversation is replaced with a tighter copy: everything you and Claude wrote is kept word for word; old command output and file views are cut to their first lines plus anything Claude referred to later; the most recent part stays exactly as it was | nothing, any computer | every request after it is ~39% smaller; big sessions with several breaks ~30% cheaper |
+| **Trim old output.** In the older part of the conversation, old command output and file contents are cut to their first lines plus any line Claude referred to later, and a short list of the names that appeared there is added. Everything you and Claude wrote stays word for word, and the most recent part stays exactly as it was | nothing, any computer | every request after it is ~39% smaller; big sessions with several breaks ~30% cheaper |
 | **Short names for long paths.** Long folder paths that repeat a lot get a short name, only when that actually saves tokens | nothing | 0–2%, often skipped |
 | **Drop replaced pieces.** A small local AI model finds pieces that later work replaced (an old view of a file that was then edited, an attempt that was redone) | a local model, 24 GB+ memory | ~4% more |
 | **Drop repeated pieces.** A larger local model finds things that were said again later | a larger local model, 48 GB+ Mac | ~3% more |
-| **Trim old output.** The larger model picks which lines of old output still matter | same | ~1% more |
+| **Pick the lines that matter.** The larger model picks which lines of old output to keep | same | ~1% more |
 | **Final check.** Before any AI-made trim is used, it quizzes both versions about the old conversation; if the trimmed one loses anything, the untrimmed one is used | same | none: it's the safety step |
 
-If Claude starts re-reading files or re-running commands more often after a
-cleanup, TokenSaver turns cleanups off and tells you.
+Trimmed output can't be read back from the conversation, but the files are
+still on disk and commands can be run again, so Claude re-reads what it needs.
+If Claude starts re-reading files or re-running commands more often after
+trimming, TokenSaver turns the break-time trimming off and tells you.
 
 ## More savings on powerful computers
 
@@ -130,7 +137,7 @@ little more during breaks:
 
 | your computer | what you get |
 |---|---|
-| any computer | everything on every message, plus the break-time cleanup |
+| any computer | everything on every message, plus the break-time trimming |
 | 24 GB+ of memory | + a small model (~9 GB download) that drops replaced pieces |
 | Mac with 48 GB+ | + a larger model (~22 GB) that drops repeated pieces, trims old output, and runs the final check |
 
@@ -150,7 +157,7 @@ TokenSaver.
 
 | you see | it means |
 |---|---|
-| ⚡ 23% | Saving 23%, and a cleanup is ready: a longer break will save more |
+| ⚡ 23% | Saving 23%, and break-time trimming is ready: a longer break will save more |
 | ⚡ 23% in green | Saving 23%, and that's as good as it gets for now |
 | ⚡ with no number | Working, no measurement yet for this session |
 | ⚡ 0% | Nothing to trim yet (a new or short session), or TokenSaver is passing this session through untouched |
