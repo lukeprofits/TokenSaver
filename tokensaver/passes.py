@@ -280,15 +280,28 @@ def plan_echo(blocks: list[Block], state: State) -> list[Block]:
     return blocks
 
 
+HEREDOC_NOTE = ("[TokenSaver: this command's inline script was saved to the file it runs, to keep "
+                "the history short. Write new scripts inline as usual; the scripts folder holds only "
+                "scripts that already ran.]")
+
+
 def heredocs(blocks: list[Block], state: State) -> list[Block]:
-    """Byte-exact heredoc vaulting, as the live PreToolUse hook does it."""
+    """Byte-exact heredoc vaulting, as the live PreToolUse hook does it.
+
+    The history copy also gets HEREDOC_NOTE in the call's `description` (shown
+    to Claude, never executed). Without it Claude sometimes imitated the short
+    form it saw in its own history and ran a script path it had made up:
+    measured 7 of 5,820 Bash commands in one developer's history, 6 of them
+    files that did not exist (each a failed command and a retry)."""
     for b in blocks:
         if b.type == "tool_use" and b.tool == "Bash" and not b.fixed:
             command = (b.input or {}).get("command")
             if isinstance(command, str) and command in b.text:
                 rewritten = capture.rewrite_command(command)
                 if rewritten:
-                    b.out_input = dict(b.input, command=rewritten[0])
+                    desc = (b.input or {}).get("description")
+                    desc = f"{desc} {HEREDOC_NOTE}" if isinstance(desc, str) and desc else HEREDOC_NOTE
+                    b.out_input = dict(b.input, command=rewritten[0], description=desc)
                     b.set_text(_tool_use_text(b.out_input), "heredocs")
                     b.vaulted = True
     return blocks
