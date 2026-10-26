@@ -379,7 +379,8 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
                  if count.errors else ""),
-              f" thinking: {', '.join(f'{_family(m)} {f:.3f} ({how.split(' ')[0]})' for m, (f, how) in factors.items())}",
+              # no same-quote nesting inside f-strings: Python before 3.12 (macOS's own 3.9) rejects it
+              " thinking: " + ", ".join(f"{_family(m)} {f:.3f} ({how.split()[0]})" for m, (f, how) in factors.items()),
               f" took {time.time() - t0:.0f}s"]
     print("\n".join(lines))
     report = {"tokensaver": __version__, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": step,
