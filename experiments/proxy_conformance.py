@@ -878,6 +878,8 @@ def main() -> int:
     try:
         proxy.passes.rewrite_messages = noisy
         h19 = dict(headers, **{"x-claude-code-session-id": "s19"})
+        for _s in ("s19", "s19-off"):     # sessions the proxy has seen (else: adopted raw, section 22)
+            proxy._bg_save(_s, {})
         a19 = [dict(m) for m in body_obj["messages"][:3]]
         b19 = a19 + [{"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
                      {"role": "user", "content": [{"type": "text", "text": "next",
@@ -1108,6 +1110,8 @@ def main() -> int:
     try:
         hist = body_obj["messages"][:3]
         h_main = dict(headers, **{"x-claude-code-session-id": "sess-aux"})
+        for _s in ("sess-aux", "sess-aux-str"):   # seen before (else: adopted raw, section 22)
+            proxy._bg_save(_s, {})
         post(base + "/v1/messages", json.dumps(dict(body_obj, messages=hist)).encode(), h_main)
         main_sent = json.loads(RECEIVED[-1]["body"])["messages"]
         aux = hist + [{"role": "user", "content": [{"type": "text", "text": "Suggest the next prompt."}]}]
@@ -1144,6 +1148,80 @@ def main() -> int:
               json.dumps(proxy._bg_load("sess-aux"), sort_keys=True) == st_before,
               "they would reset the idle timer that background compaction waits on")
     finally:
+        proxy.REWRITE = ""
+
+    print("\n22. history Anthropic saw raw stays raw (thinking is bound to it)")
+    proxy.REWRITE = "forward"
+    from tokensaver import routing as _routing
+    saved_rs = _routing.state
+    try:
+        canon = lambda ms: json.dumps(proxy._canon(ms), sort_keys=True)
+        script = "python3 - <<'PY'\n" + "print('step')\n" * 80 + "PY"
+
+        def run(n):
+            return {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "sig" * 20},
+                {"type": "tool_use", "id": f"t{n}", "name": "Bash", "input": {"command": script}}]}
+
+        def res(n, text="done"):
+            return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"t{n}", "content": text}]}
+        ask = {"role": "user", "content": [{"type": "text", "text": "fix the build"}]}
+
+        def send(msgs, sess, cls="main"):
+            out, st = proxy._rewrite(json.dumps(dict(body_obj, messages=msgs)).encode(), "/v1/messages",
+                                     cls, sess, dict(headers, **{"x-claude-code-session-id": sess}))
+            return json.loads(out)["messages"], st
+
+        # a session that started direct: the proxy's first sight of it already has replies
+        h1 = [ask, run(1), res(1), run(2), res(2, "\x1b[31mred\x1b[0m   \nmore")]
+        s1, st1 = send(h1, "s22-open")
+        check("a session first seen mid-way sends its history through Claude's last reply unchanged",
+              canon(s1[:4]) == canon(h1[:4]) and st1.get("adopted") == 4 and st1.get("adopted_why") == "first_seen",
+              "every earlier thinking block fails the prefix check (old accounts drop it, new ones get a 400)")
+        check("...and still trims what is new", "\x1b[31m" not in json.dumps(s1[4]),
+              "no saving at all on sessions open at install")
+        h1b = h1 + [{"role": "assistant", "content": [{"type": "text", "text": "fixed"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "thanks"}]}]
+        s1b, _ = send(h1b, "s22-open")
+        check("...and keeps sending those raw bytes on later requests", canon(s1b[:5]) == canon(s1[:5]),
+              "the cache and the thinking break on the next request instead")
+        fresh = [ask]
+        send(fresh, "s22-new")
+        s2, st2 = send([ask, run(1), res(1)], "s22-new")
+        check("a session that started through the proxy is rewritten as before",
+              "<<'PY'" not in json.dumps(s2[1]) and not st2.get("adopted"), "the saving would be lost for everyone")
+
+        # routing restored by the watchdog after this session's last proxied request
+        _routing.state = lambda: {"managed": True, "on": True, "at": time.time() + 5}
+        h3 = [ask, run(1), res(1), run(2), res(2), run(3), res(3)]
+        s3, st3 = send(h3, "s22-new")
+        check("after a routing gap, the replies sent direct meanwhile stay raw",
+              canon(s3[:2]) == canon(s2[:2]) and canon(s3[3:6]) == canon(h3[3:6]) and st3.get("adopted_why") == "gap",
+              "the requests that went direct during the outage bound their thinking to the raw bytes")
+        _routing.state = lambda: {"managed": True, "on": True, "at": time.time() - 3600}
+        h4 = h3 + [run(4), res(4)]
+        s4, st4 = send(h4, "s22-new")
+        check("no gap: the newest reply is trimmed as usual",
+              "<<'PY'" not in json.dumps(s4[7]) and not st4.get("adopted"), "a stale restore time would stop saving")
+
+        # Claude Code's own /compact: same history, the instruction added to the newest message
+        hc = [ask, run(1), res(1), {"role": "user", "content": [{"type": "text", "text": "go on"}]}]
+        proxy._bg_save("s22-c", {})
+        sc, _ = send(hc, "s22-c")
+        compact = hc[:-1] + [{"role": "user", "content": [{"type": "text", "text": "go on"},
+                                                          {"type": "text", "text": "Summarize the conversation."}]}]
+        cc, stc = send(compact, "s22-c", "compaction")
+        check("Claude Code's compaction request goes out with the main request's bytes",
+              canon(cc[:3]) == canon(sc[:3]) and stc.get("auxiliary"),
+              "it misses the cache and its thinking fails the prefix check (240 blocks in one /compact)")
+        other = [{"role": "user", "content": [{"type": "text", "text": "another conversation"}]}] + hc[1:]
+        raw = json.dumps(dict(body_obj, messages=other)).encode()
+        out, _ = proxy._rewrite(raw, "/v1/messages", "compaction", "s22-c",
+                                dict(headers, **{"x-claude-code-session-id": "s22-c"}))
+        check("a compaction request for a different history is relayed untouched", out == raw,
+              "someone else's bytes would be changed")
+    finally:
+        _routing.state = saved_rs
         proxy.REWRITE = ""
 
     px.shutdown(); up.shutdown()

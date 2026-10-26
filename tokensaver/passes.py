@@ -280,6 +280,8 @@ def plan_echo(blocks: list[Block], state: State) -> list[Block]:
     return blocks
 
 
+ALIAS_NOTE_MARK = "TokenSaver path aliases"     # starts the plan's definition line
+
 HEREDOC_NOTE = ("[TokenSaver: this command's inline script was saved to the file it runs, to keep "
                 "the history short. Write new scripts inline as usual; the scripts folder holds only "
                 "scripts that already ran.]")
@@ -584,7 +586,7 @@ def plan_aliases(blocks: list[Block], plan: dict[str, str]) -> list[Block]:
         out = _substitute(b.text, plan)
         if not defs_done:
             defs = ", ".join(f"{_alias_token(n)} = {p}" for p, n in sorted(plan.items(), key=lambda x: x[1]))
-            out = f"[TokenSaver path aliases, history only; always write the full path: {defs}]\n" + out
+            out = f"[{ALIAS_NOTE_MARK}, history only; always write the full path: {defs}]\n" + out
             defs_done = True
         if out != b.text:
             b.removed_by["path_aliases"] = b.removed_by.get("path_aliases", 0) + len(b.text) - len(out)

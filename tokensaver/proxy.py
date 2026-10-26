@@ -1016,6 +1016,8 @@ _MAIN_HIST: dict[str, list] = {}
 
 
 AUX_EXTRA_MAX = 4      # main history + the reply it got + an instruction, with room to spare
+# Request classes that may carry the main history and then get its bytes, read-only.
+SIDE_CLASSES = {"auxiliary", "compaction"}
 
 
 def _canon(x):
@@ -1040,13 +1042,21 @@ def _canon(x):
 
 
 def _follows_main(session: str | None, messages: list) -> bool:
-    """The session's latest main history is a prefix of `messages`, with at
-    most AUX_EXTRA_MAX messages after it."""
+    """The session's latest main history, except its newest message, is a
+    prefix of `messages`, with at most AUX_EXTRA_MAX messages after it.
+
+    The newest main message is excluded because Claude Code changes it for
+    side requests: Claude Code's own compaction request (class `compaction`)
+    is the same history with the instruction added to that message, so it has
+    exactly as many messages as main (measured: 523 and 523, 522 identical).
+    Relayed raw, it could not share the main cache and its thinking failed the
+    prefix check (240 blocks dropped in one /compact)."""
     main = _MAIN_HIST.get(session or "")
-    if not main or len(main) < 2 or not 0 < len(messages) - len(main) <= AUX_EXTRA_MAX:
+    if not main or len(main) < 2 or not 0 <= len(messages) - len(main) <= AUX_EXTRA_MAX:
         return False
-    return (json.dumps(_canon(messages[:len(main)]), sort_keys=True)
-            == json.dumps(_canon(main), sort_keys=True))
+    k = len(main) - 1
+    return (json.dumps(_canon(messages[:k]), sort_keys=True)
+            == json.dumps(_canon(main[:k]), sort_keys=True))
 
 
 # ---- sent-bytes ledger: replay what was sent, never recompute it ------------
@@ -1120,18 +1130,63 @@ def _transplant(stored, cur):
     return stored if type(stored) is type(cur) else None
 
 
+def _adopt_reason(session: str | None, messages: list) -> str | None:
+    """Why this request's history holds messages Anthropic saw WITHOUT our
+    rewrite, or None. Call before `_bg` (which creates the session's state).
+
+    Preserved thinking binds each thinking block to the exact bytes before it,
+    so history that went to Anthropic raw must stay raw. Measured 2026-10-23:
+    a Claude session already open when routing was turned on (and again when
+    the watchdog restored routing after a bypass) had all its earlier thinking
+    rejected, 160 blocks on the first proxied request, and every later request
+    of that session reported them again.
+    - first_seen: the proxy has no ledger or state for the session, yet the
+      history already has a reply from Claude (it started direct);
+    - gap: routing was (re)enabled in settings.json after this session's last
+      proxied request, so requests in between may have gone direct."""
+    if not session or not any(isinstance(m, dict) and m.get("role") == "assistant" for m in messages):
+        return None
+    led = _ledger(session)
+    if led is None:
+        return None if _bg_path(session).exists() else "first_seen"
+    try:
+        from . import routing
+        rs = routing.state()
+        if not (rs.get("managed") and rs.get("on")):
+            return None
+        t = led.get("t")
+        if t is None:
+            try:
+                t = _ledger_path(session).stat().st_mtime
+            except OSError:
+                t = 0
+        return "gap" if float(rs.get("at") or 0) > float(t) else None
+    except Exception:
+        return None
+
+
+def _last_assistant(messages: list) -> int:
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], dict) and messages[i].get("role") == "assistant":
+            return i
+    return -1
+
+
 def _replay(session: str, inp: list, out: list, epoch: str, update: bool = True,
-            legacy: str | None = None) -> tuple[list, dict]:
+            legacy: str | None = None, raw_until: int = 0) -> tuple[list, dict]:
     """`out` with the unchanged prefix replayed from the ledger (see above).
     `update=False` for side requests: they read the main ledger, never write it.
     `legacy`: the pre-v2 epoch for this request; a ledger written under it is
-    the same epoch, so a restart onto this code keeps the sent bytes."""
+    the same epoch, so a restart onto this code keeps the sent bytes.
+    `raw_until`: messages after the replayed prefix and before this index were
+    seen by Anthropic as Claude Code sent them (`_adopt_reason`): they go out
+    as `inp`, and the ledger keeps them so, for every later request."""
     fps = [_msg_fp(m) for m in inp]
     led = _ledger(session)
     info: dict = {}
+    k = 0
     if led and led.get("epoch") in (epoch, legacy):
         old = led.get("fp") or []
-        k = 0
         while k < min(len(fps), len(old), len(out)) and fps[k] == old[k]:
             k += 1
         res, drift, skipped = list(out), 0, 0
@@ -1150,8 +1205,13 @@ def _replay(session: str, inp: list, out: list, epoch: str, update: bool = True,
             info["drift"] = drift
         if skipped:
             info["replay_skipped"] = skipped
+    if raw_until > k:
+        out = list(out)
+        for i in range(k, min(raw_until, len(out), len(inp))):
+            out[i] = inp[i]
+        info["adopted"] = min(raw_until, len(out)) - k
     if update:
-        led = {"epoch": epoch, "fp": fps, "sent": out}
+        led = {"epoch": epoch, "fp": fps, "sent": out, "t": time.time()}
         _SENT[session] = led
         if len(_SENT) > 20:
             _SENT.pop(next(iter(_SENT)))
@@ -1409,7 +1469,7 @@ def _rewrite(body: bytes | None, path: str, request_class: str | None,
     if REWRITE != "forward" or not body or path.split("?")[0] != "/v1/messages":
         return body, {}
     if request_class not in REWRITE_CLASSES:
-        if request_class != "auxiliary" or REWRITE != "forward" or not session:
+        if request_class not in SIDE_CLASSES or REWRITE != "forward" or not session:
             return body, {}
         try:
             request = json.loads(body)
@@ -1447,16 +1507,25 @@ def _rewrite(body: bytes | None, path: str, request_class: str | None,
         skeleton = {k: request[k] for k in ("model", "system", "tools", "tool_choice", "thinking")
                     if k in request}
         original = messages
+        adopt = _adopt_reason(session, messages) if not _decided else None
         messages, stats = _bg(messages, session, skeleton, headers, decided=_decided)
         decide = stats.pop("bg_decide", None)
         _keep_loaded(request, stats)
         alias_arg, exclude, astats = _session_setup(session, original, stats.get("gap_s"))
         stats.update(astats)
         out = passes.rewrite_messages(messages, aliases=alias_arg, exclude=exclude)
+        raw_until = _last_assistant(messages) + 1 if adopt and not stats.get("bg_applied") else 0
+        if raw_until and alias_arg not in ("off", None) and \
+                any(passes.ALIAS_NOTE_MARK in json.dumps(m, ensure_ascii=False) for m in out[:raw_until]):
+            # The plan's definition line would go out only in the part sent raw:
+            # without it later aliases would mean nothing. No aliases this request.
+            out = passes.rewrite_messages(messages, aliases="off", exclude=exclude)
         if session:
             out, rinfo = _replay(session, messages, out, _epoch(stats.get("bg_cut"), stats.get("bg_made")),
-                                 legacy=_epoch_v1(stats.get("bg_cut"), alias_arg, exclude))
+                                 legacy=_epoch_v1(stats.get("bg_cut"), alias_arg, exclude), raw_until=raw_until)
             stats.update(rinfo)
+            if rinfo.get("adopted"):
+                stats["adopted_why"] = adopt
         request["messages"] = out
         if decide and session:
             d = _decide(session, dict(request), original, decide["cold"], headers or {}, path)
