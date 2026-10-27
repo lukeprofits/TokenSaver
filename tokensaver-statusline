@@ -12,7 +12,7 @@
 #   ⚡18%       green   the same, and nothing left that waiting would improve
 #   ⚡          default healthy, no estimate for this session yet
 #   ⚡0%        default rewriting stopped by the automatic fallback (nothing saved)
-#   ⚡down      red     proxy not answering
+#   ⚡down      red     proxy not answering for 20 s (a shorter miss shows ⚡)
 # Other sessions show nothing extra. Nothing here may break the user's line:
 # every step falls back to printing what the original command printed.
 
@@ -35,17 +35,33 @@ port="${TOKENSAVER_PROXY_PORT:-${EVERYTOKEN_PROXY_PORT:-8787}}"
 case "${ANTHROPIC_BASE_URL:-}" in
   *127.0.0.1:"$port"*|*localhost:"$port"*)
     cache="${TMPDIR:-/tmp}/tokensaver-health-$(id -u)-$port"
+    # When checks started failing; absent while the proxy answers. One failed
+    # check is not "down": seen 2026-10-27 in a Claude window open during an
+    # install, where one early miss was remembered and showed ⚡down until the
+    # first message although the proxy was fine. So a failure is never cached
+    # (the next redraw asks again), and ⚡down needs 20 s of failures.
+    downfile="$cache.down"
     now=$(date +%s)
     age=999
-    [ -f "$cache" ] && age=$(( now - $(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    [ -s "$cache" ] && age=$(( now - $(stat -f %m "$cache" 2>/dev/null || stat -c %Y "$cache" 2>/dev/null || echo 0) ))
     if [ "$age" -gt 10 ]; then
-      { curl -fsS --max-time 0.3 "http://127.0.0.1:$port/_tokensaver/health" \
-          || curl -fsS --max-time 0.3 "http://127.0.0.1:$port/_everytoken/health"; } > "$cache.tmp" 2>/dev/null \
-        && mv "$cache.tmp" "$cache" || { rm -f "$cache.tmp"; : > "$cache"; }
+      if { curl -fsS --max-time 0.3 "http://127.0.0.1:$port/_tokensaver/health" \
+             || curl -fsS --max-time 1 "http://127.0.0.1:$port/_tokensaver/health" \
+             || curl -fsS --max-time 0.3 "http://127.0.0.1:$port/_everytoken/health"; } > "$cache.tmp" 2>/dev/null; then
+        mv "$cache.tmp" "$cache"; rm -f "$downfile"
+      else
+        rm -f "$cache.tmp" "$cache"
+        [ -s "$downfile" ] || echo "$now" > "$downfile"
+      fi
     fi
     h=$(cat "$cache" 2>/dev/null)
     if [ -z "$h" ]; then
-      badge="\033[31m⚡down\033[0m"
+      since=$(cat "$downfile" 2>/dev/null); since=${since:-$now}
+      if [ $(( now - since )) -ge 20 ]; then
+        badge="\033[31m⚡down\033[0m"
+      else
+        badge="⚡"                     # not answering yet: say nothing alarming
+      fi
     elif printf '%s' "$h" | grep -q '"fallback": true' || printf '%s' "$h" | grep -q '"rewrite": "off"'; then
       badge="⚡0%"
     else
