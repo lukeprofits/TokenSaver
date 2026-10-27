@@ -189,6 +189,7 @@ def api_history(path: Path) -> tuple[list[dict], list[tuple[int, Request, int]]]
     starts over, as the API's does; the index restarts with it, so a request
     sends `messages[epoch_start:epoch_start + n]` (see `request_messages`)."""
     messages: list[dict] = []
+    ids: list = []                 # each message's reply id (assistant), kept beside it, never sent
     requests: list[tuple[int, Request, int]] = []
     seen: set[str] = set()
     start = 0
@@ -222,10 +223,26 @@ def api_history(path: Path) -> tuple[list[dict], list[tuple[int, Request, int]]]
                     if req.context or req.out:
                         requests.append((len(messages), req, start))
             items = content if isinstance(content, list) else [{"type": "text", "text": content}]
+            # Parallel tool calls: Claude Code writes a tool's result as soon as
+            # that tool finishes, while later tool_use blocks of the SAME reply
+            # are still being written (file order: call 1, call 2, result 1,
+            # call 3, ... result 2). The API saw one reply with every call,
+            # then every result. Rebuilt in file order, a call lost its result
+            # and every later count_tokens call failed with "tool_use ids were
+            # found without tool_result blocks" (one tester: 410 of 2,084).
+            if (role == "assistant" and mid and len(messages) >= start + 2
+                    and messages[-2]["role"] == "assistant" and ids[-2] == mid
+                    and all(isinstance(b, dict) and b.get("type") == "tool_result"
+                            for b in messages[-1]["content"])):
+                messages[-2]["content"] = messages[-2]["content"] + items
+                continue
             if len(messages) > start and messages[-1]["role"] == role:
                 messages[-1]["content"] = messages[-1]["content"] + items
+                if role == "assistant" and mid:
+                    ids[-1] = mid
             else:
                 messages.append({"role": role, "content": list(items)})
+                ids.append(mid if role == "assistant" else None)
     return messages, requests
 
 
