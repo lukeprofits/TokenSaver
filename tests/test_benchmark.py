@@ -48,5 +48,26 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(m[0]["content"][0]["content"][0]["type"], "tool_reference", "original untouched")
 
 
+class ReliabilityTest(unittest.TestCase):
+    def test_warns_with_reasons_when_many_counts_fail(self):
+        from tokensaver import benchmark as bm
+        count = type("C", (), {"calls": 2084, "failed": 410,
+                               "errors": {"400 messages.43: `tool_use` ids were found without `tool_result`": 66}})()
+        rows = [{"requests": 1280, "model": "claude-opus-5-5", "count_failures": 160,
+                 "ours_cost": 140.0, "plain_cost": 141.95},
+                {"requests": 840, "model": "claude-opus-5", "count_failures": 0, "ours_cost": 231.0, "plain_cost": 280.0}]
+        text = "\n".join(bm.reliability(rows, count))
+        self.assertIn("410 of 2,084 token counts failed (20%)", text)
+        self.assertIn("probably TOO LOW", text)
+        self.assertIn("1280 requests", text)
+        self.assertNotIn(" 840 requests", text, "only sessions that had failures are listed")
+        self.assertIn("tokensaver update", text)
+
+    def test_quiet_when_counts_mostly_succeed(self):
+        from tokensaver import benchmark as bm
+        count = type("C", (), {"calls": 736, "failed": 20, "errors": {}})()
+        self.assertEqual(bm.reliability([], count), [])
+
+
 if __name__ == "__main__":
     unittest.main()

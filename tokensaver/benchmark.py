@@ -204,6 +204,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     removed_at: dict[int, int] = {}
     epochs: list[int] = []
     applied, epoch, decisions, applied_at = None, 0, 0, []
+    failed = 0                     # counts Anthropic refused for this session
 
     def removed(hist, ours) -> int | None:
         a, b = _pair(lambda m: count(model, m), hist, ours)
@@ -235,6 +236,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                     new = passes.rewrite_messages(bg.apply(hist, cand), aliases="off")
                     n_now, n_new = _pair(lambda m: count(model, m), now, new)
                     decisions += 1
+                    if not (n_now and n_new):
+                        failed += 1
                     if n_now and n_new:
                         n_now += round(factor * bg._signature_chars(now))
                         n_new += round(factor * bg._signature_chars(new))
@@ -253,6 +256,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             g = removed(hist, ours)
             if g is not None:
                 removed_at[k] = g
+            else:
+                failed += 1
 
     rem = []
     for k, ep in enumerate(epochs):
@@ -282,7 +287,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                 + r.write_5m * p.write_5m + r.out * p.out) / 1e6 for r, p in zip(reqs, prices))
     breaks = sum(1 for k in range(1, len(reqs)) if sim._ts(reqs[k].timestamp) - sim._ts(reqs[k - 1].timestamp) > after_s)
     return {"requests": len(reqs), "model": model, "breaks": breaks, "counted": len(removed_at),
-            "decisions": decisions, "compactions": len(applied_at),
+            "decisions": decisions, "compactions": len(applied_at), "count_failures": failed,
             "plain_tokens": sum(plain), "ours_tokens": sum(ours),
             "plain_cost": round(price(plain, set()), 4), "ours_cost": round(price(ours, set(applied_at)), 4),
             "real_cost": round(real, 4)}
@@ -303,6 +308,37 @@ def _family(model: str) -> str:
 
 def _bucket(n: int) -> str:
     return "under 50 requests" if n < 50 else "50-199 requests" if n < 200 else "200+ requests"
+
+
+UNRELIABLE_SHARE = 0.05      # more failed counts than this: say so loudly
+
+
+def reliability(rows: list[dict], count) -> list[str]:
+    """A plain warning when too many token counts failed, with why it matters."""
+    if not count.calls or count.failed / count.calls <= UNRELIABLE_SHARE:
+        return []
+    hit = sorted((r for r in rows if r.get("count_failures")), key=lambda r: -r["count_failures"])
+    out = ["",
+           f"*** WARNING: {count.failed:,} of {count.calls:,} token counts failed "
+           f"({100 * count.failed / count.calls:.0f}%). The savings above are probably TOO LOW.",
+           "    Why: the benchmark rebuilds each past conversation from Claude Code's transcript files",
+           "    and asks Anthropic's token counter to measure it. If a rebuilt conversation does not",
+           "    match what Claude Code really sent, Anthropic refuses to count it, and usually every",
+           "    later request in that session too. Those requests are then estimated from earlier",
+           "    ones, and no break-time trimming can be decided there, so those sessions show little",
+           "    or no saving. It says nothing about TokenSaver itself, which sees the real requests.",
+           "    Usual cause: a Claude Code update changed how it writes transcripts."]
+    if hit:
+        out.append("    Most affected sessions:")
+        for r in hit[:3]:
+            out.append(f"      {r['requests']:5d} requests, {r['model'].replace('claude-', '')}: {r['count_failures']} counts failed, "
+                       f"shown {_pct(r['ours_cost'], r['plain_cost']):.1f}% cheaper (likely more)")
+    if count.errors:
+        k, v = max(count.errors.items(), key=lambda kv: kv[1])
+        out.append(f"    Most common error ({v}x): {k[:150]}")
+    out += ["    What to do: `tokensaver update`, then run the benchmark again. If this warning stays,",
+            "    please open an issue with the saved result file (numbers only, safe to share)."]
+    return out
 
 
 def summarize(rows: list[dict]) -> list[str]:
@@ -382,6 +418,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               # no same-quote nesting inside f-strings: Python before 3.12 (macOS's own 3.9) rejects it
               " thinking: " + ", ".join(f"{_family(m)} {f:.3f} ({how.split()[0]})" for m, (f, how) in factors.items()),
               f" took {time.time() - t0:.0f}s"]
+    lines += reliability(ok, count)
     print("\n".join(lines))
     report = {"tokensaver": __version__, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": step,
               "settings": {"bg_after_min": after_s / 60, "bg_warm_payback_max": payback},
