@@ -109,6 +109,8 @@ def once(check=healthy) -> str:
         did = "no change"
         if ok and not rs.get("on") and rs.get("why", "").startswith("watchdog"):
             did = "restored: " + routing.enable("watchdog: proxy healthy again", backup=False)
+        elif ok and routing.pause_due(rs):
+            did = "pause over: " + routing.enable("watchdog: pause ended at midnight", backup=False)
         elif not ok and rs.get("on") and st["fails"] >= FAILS_TO_DISABLE:
             did = "bypassed: " + routing.disable("watchdog: proxy not answering", backup=False)
         _save(st)

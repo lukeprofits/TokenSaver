@@ -103,8 +103,24 @@ def enable(why: str, backup: bool = True) -> str:
     return f"set {', '.join(changed)} in {SETTINGS}" if changed else "already routed"
 
 
-def disable(why: str, backup: bool = True, forget: bool = False) -> str:
-    """Take our entries out (restoring anything we replaced). `forget`: uninstall."""
+def next_midnight(now: float | None = None) -> float:
+    """The next local midnight, as a timestamp (`tokensaver pause` lasts until then)."""
+    import datetime as dt
+    t = dt.datetime.fromtimestamp(now if now is not None else time.time())
+    return (t.replace(hour=0, minute=0, second=0, microsecond=0) + dt.timedelta(days=1)).timestamp()
+
+
+def pause_due(st: dict | None = None, now: float | None = None) -> bool:
+    """A `tokensaver pause` whose time is up."""
+    st = state() if st is None else st
+    until = st.get("until")
+    return (not st.get("on") and str(st.get("why", "")).startswith("pause")
+            and until is not None and (now if now is not None else time.time()) >= float(until))
+
+
+def disable(why: str, backup: bool = True, forget: bool = False, until: float | None = None) -> str:
+    """Take our entries out (restoring anything we replaced). `forget`: uninstall.
+    `until`: a pause, which the watchdog ends at that time."""
     st = state()
     added, replaced = dict(st.get("added") or {}), dict(st.get("replaced") or {})
     data = read_settings()
@@ -132,7 +148,11 @@ def disable(why: str, backup: bool = True, forget: bool = False) -> str:
         except OSError:
             pass
     else:
-        _save_state(dict(st, on=False, why=why, at=time.time(), flips=st.get("flips", 0) + (1 if changed else 0)))
+        new = dict(st, on=False, why=why, at=time.time(), flips=st.get("flips", 0) + (1 if changed else 0))
+        new.pop("until", None)
+        if until is not None:
+            new["until"] = until
+        _save_state(new)
     return f"removed {', '.join(changed)} from {SETTINGS}" if changed else "nothing of ours to remove"
 
 

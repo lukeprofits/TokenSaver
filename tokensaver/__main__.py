@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from . import (__version__, doctor, install, proxy, report, sessions, simulate,
@@ -12,6 +13,72 @@ from . import (__version__, doctor, install, proxy, report, sessions, simulate,
 from .transcripts import DEFAULT_ROOT, load
 
 DEFAULT_THRESHOLDS = [400_000, 300_000, 200_000, 100_000]
+
+
+HELP = """TokenSaver: spends fewer tokens on Claude Code without changing how you work.
+
+Everyday commands:
+  tokensaver status        is it on, off or paused?
+  tokensaver off           turn it off: new Claude sessions go straight to Anthropic
+                           (for example to use Remote Control); stays off until `on`
+  tokensaver pause         turn it off for the rest of today; back on by itself at midnight
+  tokensaver on            turn it back on (also ends a pause early)
+
+Checking and numbers:
+  tokensaver doctor        is it installed and working?
+  tokensaver proxy --stats what it has saved so far
+  tokensaver --benchmark   what it would have saved on your past Claude sessions
+                           (asks first; uses Anthropic's free token counter)
+
+Keeping it current, or removing it:
+  tokensaver update        get the latest version
+  tokensaver uninstall     remove it completely and put your settings back
+
+After off or pause, Claude sessions already open keep using TokenSaver until you
+restart them. Every command: tokensaver --help"""
+
+
+def _toggle(cmd: str) -> int:
+    """`tokensaver on|off|status`. Off takes TokenSaver's entries out of
+    settings.json (the same three keys the watchdog removes) and leaves the
+    proxy running, so sessions already open keep working. The watchdog only
+    restores routing it removed itself, so off stays off until `on`."""
+    from . import routing, service
+    rs, h = routing.state(), service.health()
+    if cmd == "status":
+        if routing.is_on():
+            state = "on"
+        elif str(rs.get("why", "")).startswith("pause") and rs.get("until"):
+            state = f"paused until {time.strftime('%a %H:%M', time.localtime(float(rs['until'])))}"
+        elif str(rs.get("why", "")).startswith("off"):
+            state = "off (`tokensaver on` to turn it back on)"
+        elif str(rs.get("why", "")).startswith("watchdog"):
+            state = "off for now: the proxy stopped answering; it comes back on by itself when the proxy is up"
+        else:
+            state = "off (not set up: `tokensaver setup`)"
+        print(f"TokenSaver is {state}; proxy {'answering' if h else 'not answering'}")
+        return 0
+    if cmd == "pause":
+        until = routing.next_midnight()
+        print(routing.disable("pause: turned off by the user until midnight", until=until))
+        print(f"Paused until midnight ({time.strftime('%a %H:%M', time.localtime(until))}): new Claude Code sessions "
+              "go straight to Anthropic until then. Sessions already open keep using TokenSaver until you restart "
+              "them. `tokensaver on` ends the pause early.")
+        return 0
+    if not rs.get("managed") and cmd == "on" and not routing.is_on():
+        print("TokenSaver routing was never set up here; run `tokensaver setup` first")
+        return 1
+    if cmd == "off":
+        print(routing.disable("off: turned off by the user"))
+        print("New Claude Code sessions now go straight to Anthropic (Remote Control works there). "
+              "Sessions already open keep using TokenSaver until you restart them. `tokensaver on` to undo.")
+        return 0
+    if not h:
+        print("The proxy is not answering, so TokenSaver stays off (see `tokensaver doctor`).")
+        return 1
+    print(routing.enable("on: turned on by the user"))
+    print("New Claude Code sessions go through TokenSaver again; sessions already open pick it up too.")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -98,6 +165,12 @@ def main(argv: list[str] | None = None) -> int:
     p_setup.add_argument("--aliases", choices=("try", "replace"), default="try",
                          help="try: add claude-ts beside your aliases (default); replace: reroute claude itself")
     sub.add_parser("restart", help="restart the background proxy once nothing is in flight")
+    sub.add_parser("on", help="turn TokenSaver back on for new Claude Code sessions")
+    sub.add_parser("off", help="turn TokenSaver off: new Claude Code sessions go straight to Anthropic "
+                              "(for example to use Remote Control); `tokensaver on` undoes it")
+    sub.add_parser("pause", help="turn TokenSaver off until midnight (local time), then back on by itself")
+    sub.add_parser("status", help="is TokenSaver on, off or paused, and is the proxy answering")
+    sub.add_parser("help", help="the everyday commands, in plain words")
     sub.add_parser("update", help="pull the latest TokenSaver and restart the proxy")
     p_mig = sub.add_parser("migrate", help="move this machine from the old name (everytoken) to TokenSaver, once")
     p_mig.add_argument("--dry-run", action="store_true")
@@ -129,8 +202,8 @@ def main(argv: list[str] | None = None) -> int:
     # `tokensaver --benchmark` (a flag reads naturally for a one-off) is the benchmark command.
     if argv and argv[0] == "--benchmark":
         argv[0] = "benchmark"
-    if not argv:
-        ap.print_help()
+    if not argv or argv[0] == "help":
+        print(HELP)
         return 0
     args = ap.parse_args(argv)
 
@@ -160,6 +233,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             print("(dry run: nothing changed)")
         return 0
+    if args.cmd in ("on", "off", "pause", "status"):
+        return _toggle(args.cmd)
     if args.cmd == "restart":
         from . import service as sv
         import time as _t

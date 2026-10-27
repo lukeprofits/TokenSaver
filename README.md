@@ -49,6 +49,11 @@ own Claude login.)
 ## Commands
 
 ```sh
+tokensaver help          # what each command does
+tokensaver status        # is it on, off or paused?
+tokensaver off           # turn it off: new Claude sessions go straight to Anthropic
+tokensaver pause         # off for the rest of today, back on by itself at midnight
+tokensaver on            # turn it back on (also ends a pause early)
 tokensaver doctor        # is it installed and working?
 tokensaver --benchmark   # what it would have saved on your past sessions
 tokensaver proxy --stats # what it has saved so far
@@ -171,8 +176,9 @@ and after your first long break.
 - macOS is tested. Linux should work but hasn't been tried on a real machine
   yet.
 - Needs Python 3.9+ and Claude Code.
-- Claude Code's Remote Control feature isn't available while TokenSaver is
-  installed (Claude Code turns it off for custom setups like this).
+- Claude Code's Remote Control feature isn't available while TokenSaver is on
+  (Claude Code turns it off for custom setups like this). Run `tokensaver off`,
+  start a new Claude session for Remote Control, and `tokensaver on` afterwards.
 - The Claude desktop app hasn't been tested.
 - TokenSaver keeps a local copy of your sessions in `~/.tokensaver`, the same
   kind of material Claude Code already keeps in `~/.claude`. Nothing leaves
