@@ -34,6 +34,7 @@ explicit that a pinned allowlist breaks on the release that adds a capability.
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import os
@@ -170,23 +171,32 @@ def _evict(now: float) -> None:
             _LIVE.pop(session, None)
 
 
-RETUNE_EVERY_S = 30 * 86400
+# Weekly (was monthly until 2026-10-29): a new user has enough history after
+# about a week, and a monthly check left them on the defaults for 30 days.
+# `tune` only moves a value on a meaningful difference, so this cannot jitter.
+RETUNE_EVERY_S = 7 * 86400
 _retune_checked = 0.0
 
 
+def _last_tune_age(now: float) -> float | None:
+    """Seconds since the last tune run (stored as UTC), None if never or unreadable."""
+    last = config.section("tune").get("last_run")
+    try:
+        return now - calendar.timegm(time.strptime(last, "%Y-%m-%dT%H:%M:%SZ")) if last else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _maybe_retune(now: float) -> None:
-    """Monthly, in its own thread: re-fit the idle threshold to the user's
-    latest habits. `tune` itself refuses to change anything until enough real
-    token data exists, and falls back to the default on thin evidence."""
+    """Weekly, in its own thread: re-fit the idle threshold and the warm-swap
+    payback limit to the user's latest habits. `tune` itself refuses to change
+    anything until enough real data exists, and falls back to the default on
+    thin evidence."""
     global _retune_checked
     if now - _retune_checked < 86400:
         return
     _retune_checked = now
-    last = config.section("tune").get("last_run")
-    try:
-        age = now - time.mktime(time.strptime(last, "%Y-%m-%dT%H:%M:%SZ")) if last else None
-    except ValueError:
-        age = None
+    age = _last_tune_age(now)
     if age is not None and age < RETUNE_EVERY_S:
         return
 
