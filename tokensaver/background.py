@@ -153,6 +153,11 @@ def _json_list(text: str):
 # with the binding check passed, 2026-10-30 (Opus 5 0.200, Sonnet 5 0.262 that day).
 # It replaced 0.14 (2026-10-22, measured without the check, so possibly on thinking
 # the API had already dropped).
+# TODO(thinking-rate): revisit once Opus 5.5 has >= 10 weekly measurements from >= 3
+# sessions (`tokensaver proxy --stats`, "Thinking rate"). As of 2026-10-30 the data
+# disagrees: 0.264 (session 5e20528f) vs 0.125 / 0.123 (session 5483d59d). If the
+# fit settles well away from 0.264, set this default to it (the fallback for models
+# and machines without enough measurements) and note the date and sample size here.
 TOKENS_PER_SIGNATURE_CHAR = 0.264
 # Models differ (measured Opus 5 0.200, Sonnet 5 0.262), so the rate is per model:
 # the proxy sets MODEL (per thread) to the session's model around its estimates,
