@@ -188,11 +188,19 @@ FACTOR_BOUNDS = (0.02, 0.5)
 
 def _sent_requests(per_model: int = 4) -> dict[str, list[tuple[dict, int]]]:
     """{model: [(count_tokens body as sent, signature chars)]} from this machine's
-    TokenSaver history: each session's latest main request whose messages the
-    ledger holds. Read-only; nothing leaves the machine here."""
+    TokenSaver history: first the thinking-rate samples (`thinking`, kept 30
+    days), then each session's latest main request whose messages the ledger
+    holds (the 7-day debug copies). Read-only; nothing leaves the machine here."""
     import sqlite3
-    from . import vault
+    from . import thinking, vault
     out: dict[str, list] = {}
+    seen: set = set()
+    for session, e in sorted(thinking._index()["samples"].items(), key=lambda kv: -kv[1].get("stored_at", 0)):
+        sample = thinking.load(session)
+        model = (sample or {}).get("model") or ""
+        if sample and len(out.setdefault(model, [])) < per_model:
+            out[model].append((sample, e.get("sig_chars") or bg._signature_chars(sample["messages"])))
+            seen.add(thinking._safe(session))
     state = vault.VAULT_DIR / "proxy_state"
     if not state.is_dir() or not vault.DB_PATH.exists():
         return out
@@ -209,6 +217,8 @@ def _sent_requests(per_model: int = 4) -> dict[str, list[tuple[dict, int]]]:
             if not isinstance(sent, list) or bg._signature_chars(sent) < MIN_SIG_CHARS:
                 continue
             session = led_path.name[:-len(".bg.sent.json")]
+            if session in seen:
+                continue                        # already measured from its sample
             for (eid,) in conn.execute("SELECT id FROM events WHERE kind='api_request' AND session_id=? "
                                        "ORDER BY id DESC LIMIT 5", (session,)):
                 got = vault.read(eid)
@@ -544,9 +554,13 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         print(f"  {_version(m)}: {fa['value']:.3f} tokens per signature char ({fa['how']})")
     fallback = {"value": DEFAULT_SIG_FACTOR, "source": "fallback", "n": 0, "how": "fallback"}
     rows, t0 = [], time.time()
+    # The replay's own size estimates (worth_compacting, choose_cut) use the same
+    # per-model rate as its arithmetic, not the default.
+    bg.SIG_FACTOR = lambda model=None: factors.get(model, fallback)["value"]
     for i, d in enumerate(sorted(data, key=lambda d: len(d.requests)), 1):
         fa = factors.get(d.session.primary_model, fallback)
         f = fa["value"]
+        bg.MODEL.set(d.session.primary_model)
         t = time.time()
         try:
             r = replay(d, count, step, after_s, payback, f)

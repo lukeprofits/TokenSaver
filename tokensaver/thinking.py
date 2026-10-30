@@ -157,16 +157,22 @@ def _transient(why: str) -> bool:
                            "count refused: no response"))
 
 
-def measure_due(count, now: float | None = None) -> int:
-    """Measure every sample not yet measured. `count(body, beta) -> (tokens | None, why)`.
-    Stops at a rate-limit or network error (the rest wait for the next job); the
-    week restarts only when everything waiting was measured. Returns how many."""
+PER_JOB = 3                      # samples measured per audit job: the audit queue keeps moving
+
+
+def measure_due(count, now: float | None = None, limit: int = PER_JOB) -> int:
+    """Measure up to `limit` samples not yet measured. `count(body, beta) -> (tokens | None, why)`.
+    Each is two uploads of a whole request, so a few per job, the rest on the
+    next jobs. Stops at a rate-limit or network error. The week restarts only
+    when everything waiting was measured. Returns how many."""
     from .audit import measure_thinking
     now = time.time() if now is None else now
     done = 0
     for session, e in list(_index()["samples"].items()):
         if e.get("measured_at"):
             continue
+        if done >= limit:
+            return done
         body = load(session)
         if body is None:
             continue

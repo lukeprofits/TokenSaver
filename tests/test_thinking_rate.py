@@ -133,6 +133,22 @@ class WeeklyTest(unittest.TestCase):
         thinking.store("s2", body(extra="new"), now=time.time())
         self.assertFalse(thinking.due(), "a new sample waits for next week")
 
+    def test_a_few_per_job_until_all_are_measured(self):
+        for i in range(5):
+            thinking.store(f"s{i}", body(extra=str(i)), now=time.time())
+        count = counter(0.25)[0]
+        self.assertEqual(thinking.measure_due(count), thinking.PER_JOB)
+        self.assertTrue(thinking.due(), "the rest still wait: the week has not restarted")
+        self.assertEqual(thinking.measure_due(count), 5 - thinking.PER_JOB)
+        self.assertFalse(thinking.due())
+
+    def test_benchmark_measures_from_the_samples(self):
+        from tokensaver import benchmark
+        thinking.store("s-bench", body(), now=time.time())
+        got = benchmark._sent_requests()
+        self.assertIn("claude-opus-5-5", got)
+        self.assertEqual(got["claude-opus-5-5"][0][0]["messages"], body()["messages"])
+
     def test_rate_limit_leaves_samples_for_the_next_job(self):
         thinking.store("s1", body(), now=time.time())
         self.assertEqual(thinking.measure_due(counter(refuse=(429, "rate limited"))[0]), 0)
