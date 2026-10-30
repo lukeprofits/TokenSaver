@@ -34,6 +34,7 @@ was possible lost money on 7 real breaks.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import os
@@ -153,7 +154,12 @@ def _json_list(text: str):
 # It replaced 0.14 (2026-10-22, measured without the check, so possibly on thinking
 # the API had already dropped).
 TOKENS_PER_SIGNATURE_CHAR = 0.264
-SIG_FACTOR = lambda: TOKENS_PER_SIGNATURE_CHAR      # noqa: E731  replaced by the proxy
+# Models differ (measured Opus 5 0.200, Sonnet 5 0.262), so the rate is per model:
+# the proxy sets MODEL (per thread) to the session's model around its estimates,
+# and points SIG_FACTOR at the per-model fit. Unset, or a model without enough
+# measurements: the default.
+MODEL: contextvars.ContextVar = contextvars.ContextVar("tokensaver_model", default=None)
+SIG_FACTOR = lambda model=None: TOKENS_PER_SIGNATURE_CHAR      # noqa: E731  replaced by the proxy
 
 
 def _signature_chars(x) -> int:
@@ -174,7 +180,7 @@ def size_tokens(messages: list) -> int:
     made old parts with much thinking look far bigger than they bill)."""
     sig = _signature_chars(messages)
     total = len(json.dumps(messages, ensure_ascii=False))
-    return round((total - sig) / CHARS_PER_TOKEN + sig * SIG_FACTOR())
+    return round((total - sig) / CHARS_PER_TOKEN + sig * SIG_FACTOR(MODEL.get()))
 
 
 def fingerprint(messages: list) -> str:

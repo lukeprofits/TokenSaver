@@ -257,27 +257,25 @@ def _count(path: str, headers: dict, body: dict) -> tuple[int | None, int, dict]
 # off). A pass that changed nothing in a request costs no call. The proxy
 # switches a pass off for new free points when it measures as a net cost.
 ATTRIBUTE = ("heredocs", "repeat_runs", "format", "json_compact", "path_aliases")
-CALLS_PER_JOB = 2 + len(ATTRIBUTE) + 2          # + the thinking measurement (below), when sampled
+CALLS_PER_JOB = 2 + len(ATTRIBUTE)
 
 
 # ---- the thinking rate --------------------------------------------------------
 #
 # Claude's earlier reasoning travels in the request as thinking blocks with a long
 # signature, and is billed as input. How many tokens per signature character is
-# measured here, on requests as TokenSaver sent them: on Opus 5.5+ thinking counts
-# only on the exact bytes first sent, so only these can show it. Each measurement
-# counts the request with its thinking, under the binding check set to "error"
-# (the API refuses rather than silently ignore thinking that is not valid for the
-# bytes), and without it. A refused count is recorded with its reason and never
-# disables the audit.
+# measured on requests as TokenSaver sent them: on Opus 5.5+ thinking counts only
+# on the exact bytes first sent. The worker keeps a small sample of such requests
+# (`thinking.store`) and once a week measures what it kept (`thinking.measure_due`),
+# on the current job's in-flight credentials. Each measurement counts the request
+# with its thinking, under the binding check set to "error" (the API refuses
+# rather than silently ignore thinking that is not valid for the bytes), and
+# without it. A refused count is recorded with its reason and never disables the
+# audit.
 BINDING_BETA = "thinking-binding-controls-2026-08-01"
-SIG_MIN_CHARS = 20_000           # smaller signatures measure too coarsely
 SIG_BOUNDS = (0.02, 0.5)         # outside: a broken count, not a rate
-SIG_SESSION_EVERY_S = 30 * 60    # at most one measurement per session per 30 min
-SIG_MAX_PER_DAY = 60
-SIG_MIN_ROWS, SIG_MIN_SESSIONS = 5, 2
+SIG_MIN_ROWS, SIG_MIN_SESSIONS = 10, 3
 SIG_WINDOW_DAYS = 60
-_sig_last: dict[str, float] = {}
 
 
 def count_copy(body: dict) -> dict:
@@ -319,31 +317,22 @@ def measure_thinking(body: dict, count) -> dict:
     return out
 
 
-def _measure_due(job: dict, sent: dict) -> bool:
-    from .background import _signature_chars
-    th = sent.get("thinking")
-    if not isinstance(th, dict) or th.get("type") in (None, "disabled"):
-        return False
-    if _signature_chars(sent.get("messages") or []) < SIG_MIN_CHARS:
-        return False
-    if time.time() - _sig_last.get(job.get("session") or "", 0) < SIG_SESSION_EVERY_S:
-        return False
-    if _state.get("sig_day") != _day():
-        _state.update(sig_day=_day(), sig_today=0)
-    if _state["calls_today"] + 2 > int(config.get("audit_max_per_day")):
-        return False
-    return _state["sig_today"] < SIG_MAX_PER_DAY
-
-
-def _measure_job(job: dict) -> None:
-    """Measure on this job's sent request if due; record a `thinking_factor` row.
-    Errors here skip the measurement only: no backoff, never `_on_error`."""
-    sent = payload(job["sent"])
-    if not sent or not _measure_due(job, sent):
+def _samples_job(job: dict) -> None:
+    """Keep this job's sent request as its session's sample if it is worth
+    measuring; if a week has passed, measure the samples waiting. Errors here
+    never reach `_on_error`: the audit itself is not affected."""
+    from . import thinking
+    try:
+        thinking.store(job.get("session"), payload(job["sent"]))
+    except Exception:
+        pass
+    if not thinking.due():
         return
     headers = dict(job["headers"])
 
     def count(body: dict, beta: str) -> tuple[int | None, str]:
+        if _state["calls_today"] + 1 > int(config.get("audit_max_per_day")):
+            return None, "no response (daily cap)"
         h = dict(headers, **{"anthropic-beta": ",".join(x for x in (headers.get("anthropic-beta"), beta) if x)})
         _state.pop("last_error", None)
         n, code, _ = _count(job["path"], h, body)
@@ -351,57 +340,38 @@ def _measure_job(job: dict) -> None:
         _state["calls_today"] += 1
         return n, "" if n is not None else f"{code} {_state.get('last_error') or ''}".strip()
 
-    _sig_last[job.get("session") or ""] = time.time()
-    if len(_sig_last) > 200:
-        _sig_last.pop(next(iter(_sig_last)))
-    _state["sig_today"] += 1
-    got = measure_thinking(sent, count)
-    if got["with"] is None and got["why"].startswith(("count refused: 429", "count refused: 5",
-                                                      "count refused: 0", "count refused: no response")):
-        return                         # rate limit or network: not a fact about the request
-    vault.record("thinking_factor", tool="proxy", session_id=job.get("session"), index=False,
-                 summary=(f"thinking {got['factor']:.3f} tokens per signature char ({got['sig_chars']:,} chars)"
-                          if got["factor"] else f"thinking not measured: {got['why']}"),
-                 meta=dict(got, model=sent.get("model")))
+    thinking.measure_due(count)
 
 
 def signature_factor(model: str | None = None) -> tuple[float, str, dict]:
-    """(tokens per signature char, why, {"n", "sessions", "source"}), fitted from this
-    machine's `thinking_factor` rows: the model's own median when it has
-    SIG_MIN_ROWS from SIG_MIN_SESSIONS sessions, else all models', else the default."""
+    """(tokens per signature char, why, {"n", "sessions", "source"}) for `model`:
+    the median of its own measurements on this machine in the last SIG_WINDOW_DAYS,
+    once there are SIG_MIN_ROWS from SIG_MIN_SESSIONS sessions. Otherwise the
+    default: never another model's rate (models differ, new ones keep coming)."""
     import sqlite3
     from .background import TOKENS_PER_SIGNATURE_CHAR as default
     rows = []
-    try:
-        conn = sqlite3.connect(f"file:{vault.DB_PATH}?mode=ro", uri=True, timeout=5)
-        try:
-            since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - SIG_WINDOW_DAYS * 86400))
-            rows = [(json.loads(meta or "{}"), sid) for meta, sid in conn.execute(
-                "SELECT meta, session_id FROM events WHERE kind='thinking_factor' AND ts >= ?", (since,))]
-        finally:
-            conn.close()
-    except Exception:
-        rows = []
-    good = [(m, sid) for m, sid in rows if isinstance(m.get("factor"), (int, float))]
-
-    def fit(pick):
-        vals = sorted(m["factor"] for m, sid in pick)
-        sess = {sid for _, sid in pick}
-        if len(vals) >= SIG_MIN_ROWS and len(sess) >= SIG_MIN_SESSIONS:
-            return vals[len(vals) // 2], len(vals), len(sess)
-        return None
-
     if model:
-        own = fit([(m, s) for m, s in good if m.get("model") == model])
-        if own:
-            return own[0], f"measured {own[0]:.3f} (median of {own[1]} requests, {own[2]} sessions)", \
-                {"n": own[1], "sessions": own[2], "source": "measured"}
-    pooled = fit(good)
-    if pooled:
-        return pooled[0], f"measured {pooled[0]:.3f} (median of {pooled[1]} requests, {pooled[2]} sessions, " \
-                          f"all models)", {"n": pooled[1], "sessions": pooled[2], "source": "measured_all"}
-    return default, f"default {default:.3f} ({len(good)}/{SIG_MIN_ROWS} measured)", \
-        {"n": len(good), "sessions": len({s for _, s in good}), "source": "default"}
+        try:
+            conn = sqlite3.connect(f"file:{vault.DB_PATH}?mode=ro", uri=True, timeout=5)
+            try:
+                since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - SIG_WINDOW_DAYS * 86400))
+                rows = [(json.loads(meta or "{}"), sid) for meta, sid in conn.execute(
+                    "SELECT meta, session_id FROM events WHERE kind='thinking_factor' AND ts >= ?", (since,))]
+            finally:
+                conn.close()
+        except Exception:
+            rows = []
+    good = [(m, sid) for m, sid in rows if m.get("model") == model and isinstance(m.get("factor"), (int, float))]
+    vals = sorted(m["factor"] for m, _ in good)
+    sess = {sid for _, sid in good}
+    if len(vals) >= SIG_MIN_ROWS and len(sess) >= SIG_MIN_SESSIONS:
+        v = vals[len(vals) // 2]
+        return v, f"measured {v:.3f} (median of {len(vals)} requests, {len(sess)} sessions)", \
+            {"n": len(vals), "sessions": len(sess), "source": "measured"}
+    return default, (f"default {default:.3f} ({len(vals)}/{SIG_MIN_ROWS} measured, "
+                     f"{len(sess)}/{SIG_MIN_SESSIONS} sessions)"), \
+        {"n": len(vals), "sessions": len(sess), "source": "default"}
 
 
 def _toggled(orig: dict, name: str, base: tuple) -> tuple[dict | None, bool]:
@@ -544,7 +514,7 @@ def _run(job: dict) -> None:
                        "tokens_sent_nt": content_nt[1]},
                  index=False)
     try:
-        _measure_job(job)
+        _samples_job(job)
     except Exception:
         pass
 

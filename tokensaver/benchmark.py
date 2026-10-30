@@ -258,8 +258,8 @@ def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict
         except Exception:
             continue
         if info["source"] == "measured":
-            out[model] = {"value": v, "source": "continuous", "n": info["n"],
-                          "how": f"measured continuously on this machine: {info['n']} sent requests, "
+            out[model] = {"value": v, "source": "weekly", "n": info["n"],
+                          "how": f"TokenSaver's weekly measurements on this machine: {info['n']} sent requests, "
                                  f"{info['sessions']} sessions"}
     for model, items in _sent_requests(per_model).items():
         if model in out:

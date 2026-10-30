@@ -246,6 +246,7 @@ def _bg_worker() -> None:
                 if bad:
                     _note_strain(why)
             for session, live in list(_LIVE.items()):
+                background.MODEL.set(_model_of(session))     # size estimates use this model's rate
                 if now - live["last"] < BG_PREP_IDLE_S:
                     if not bad:
                         _prework(session, live)
@@ -1271,23 +1272,30 @@ def sim_factor() -> float:
     return _FACTOR["value"] or 0.92
 
 
-_SIG = {"at": 0.0, "value": None, "why": ""}
+_SIG: dict[str | None, dict] = {}      # model -> {"at", "value", "why"}
 
 
-def sig_factor() -> float:
-    """Tokens per thinking-signature character, fitted from this machine's own
-    measurements (`audit.signature_factor`, all models pooled: the size estimates
-    have no model), cached for 10 minutes. `background.size_tokens` reads it."""
-    if time.time() - _SIG["at"] > 600:
+def sig_factor(model: str | None = None) -> float:
+    """Tokens per thinking-signature character for `model`, fitted from this
+    machine's own weekly measurements (`audit.signature_factor`), refreshed daily.
+    `background.size_tokens` reads it for the model in `background.MODEL`."""
+    c = _SIG.get(model)
+    if c is None or time.time() - c["at"] > 86400:
         try:
-            _SIG["value"], _SIG["why"], _ = audit.signature_factor()
+            v, why, _ = audit.signature_factor(model)
         except Exception:
-            _SIG["value"], _SIG["why"] = background.TOKENS_PER_SIGNATURE_CHAR, "default (fit failed)"
-        _SIG["at"] = time.time()
-    return _SIG["value"] or background.TOKENS_PER_SIGNATURE_CHAR
+            v, why = background.TOKENS_PER_SIGNATURE_CHAR, "default (fit failed)"
+        c = _SIG[model] = {"at": time.time(), "value": v, "why": why}
+        if len(_SIG) > 20:
+            _SIG.pop(next(iter(_SIG)))
+    return c["value"] or background.TOKENS_PER_SIGNATURE_CHAR
 
 
 background.SIG_FACTOR = sig_factor
+
+
+def _model_of(session: str | None) -> str | None:
+    return ((_LIVE.get(session or "") or {}).get("skeleton") or {}).get("model")
 
 
 def estimate(session: str) -> dict:
@@ -1295,6 +1303,7 @@ def estimate(session: str) -> dict:
     longer pause would unlock, "done": nothing left that waiting could improve},
     or {} when this session is unknown. Never raises."""
     try:
+        background.MODEL.set(_model_of(session))     # this handler thread only
         n = _NOW.get(session)
         if not n or not n["in"]:
             return {}
@@ -1762,7 +1771,8 @@ class Handler(BaseHTTPRequestHandler):
             from . import __version__
             payload = json.dumps({"ok": True, "rewrite": REWRITE or "off",
                                   "bg_compact": BG_COMPACT, "audit": audit.status(),
-                                  "thinking_rate": {"value": round(sig_factor(), 4), "why": _SIG["why"]},
+                                  "thinking_rate": {str(m): {"value": round(c["value"], 4), "why": c["why"]}
+                                                    for m, c in list(_SIG.items()) if m},
                                   "fallback": bool(_global_off()), "version": __version__,
                                   "pid": os.getpid(), "started": _STARTED,
                                   "inflight": _INFLIGHT[0], "code": _CODE_ID, "estimate": True,
@@ -2205,24 +2215,30 @@ def _prune_lines() -> list[str]:
 
 
 def thinking_rate_line() -> str:
-    """The thinking rate in use and where it comes from, per model measured."""
+    """The thinking rate in use per model and what it rests on, plus the sample store."""
     import sqlite3
-    value, why, _ = audit.signature_factor()
+    from . import thinking
     models = set()
     try:
         conn = sqlite3.connect(f"file:{vault.DB_PATH}?mode=ro", uri=True, timeout=5)
         models = {json.loads(m or "{}").get("model") for (m,) in conn.execute(
-            "SELECT meta FROM events WHERE kind='thinking_factor'")} - {None}
+            "SELECT meta FROM events WHERE kind='thinking_factor'")}
         conn.close()
     except Exception:
         pass
-    per = []
-    for m in sorted(models):
-        v, w, info = audit.signature_factor(m)
-        if info["source"] == "measured":
-            per.append(f"{m.replace('claude-', '')} {v:.3f} (n={info['n']})")
-    return (f"Thinking rate: {value:.3f} tokens per signature char, {why}"
-            + (f"; per model: {', '.join(per)}" if per else ""))
+    models |= {e.get("model") for e in thinking._index()["samples"].values()}
+    lines = ["Thinking rate (tokens per signature char, per model; a model without enough "
+             "measurements uses the default):"]
+    for m in sorted(models - {None}):
+        v, why, _ = audit.signature_factor(m)
+        lines.append(f"  {m.replace('claude-', '')}: {v:.3f}, {why}")
+    if len(lines) == 1:
+        lines.append(f"  no measurements yet: default {background.TOKENS_PER_SIGNATURE_CHAR:.3f}")
+    s = thinking.summary()
+    lines.append(f"  samples kept: {s['sessions']} session(s), {s['bytes'] / 2 ** 20:.0f} MB, "
+                 f"{s['waiting']} waiting; next measuring "
+                 + (f"in {s['next_in_s'] / 86400:.1f} days" if s["next_in_s"] else "on the next request"))
+    return "\n".join(lines)
 
 
 def _token_lines() -> list[str]:
