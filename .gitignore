@@ -8,3 +8,6 @@ __pycache__/
 /everytoken-*
 # working notes for Claude, kept local
 CLAUDE.md
+
+# benchmark results from named people, kept local
+results/

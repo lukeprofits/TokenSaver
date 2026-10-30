@@ -13,6 +13,36 @@ Claude Code in your terminal, VS Code or JetBrains goes through TokenSaver
 automatically. It runs on any computer, no AI model needed. You'll see a small
 ⚡ with the % saved in Claude Code's status line.
 
+## How it works, in 7 slides
+
+![A local optimization layer: Claude Code, then TokenSaver, then Anthropic. Kept word for word: everything you typed, everything Claude said, the most recent ~30K tokens, any line Claude referred to later. Trimmed down: old copies of file contents and old command output, which stay on disk.](docs/slides/1-where.png)
+
+**It sits between Claude Code and Anthropic.** Your words and Claude's are never touched; only old copies of files and command output get trimmed.
+
+![One real request: a thin new part on top of ~390K tokens of cached context, sent again on every request.](docs/slides/2-resend.png)
+
+**Every request resends the whole conversation.** That repeated part is most of your bill.
+
+![Keeping a 555K cached context is billed like 28K tokens ($0.11), while swapping in a smaller 378K one is billed like 756K tokens ($3.02).](docs/slides/3-every.png)
+
+**Anthropic's cache makes resending cheap, so sending less can cost more.** Replacing the cache is the expensive part.
+
+![Cost over time: at each swap the TokenSaver line jumps up a little, then grows more slowly than the line without it, leaving a savings gap.](docs/slides/4-crossover.png)
+
+**So TokenSaver swaps only when it pays off:** a small one-time cost, then every request after is cheaper.
+
+![The same real session with and without TokenSaver: 7.36M tokens and $18.76 without, 5.13M tokens and $13.33 with.](docs/slides/5-swap.png)
+
+**A real session, with and without:** 30% fewer tokens over these 12 requests.
+
+![After a night away: 593K tokens billed like 1.19M ($4.74) without TokenSaver, 365K billed like 730K ($2.93) with it, $1.81 saved.](docs/slides/6-brk.png)
+
+**After a break of an hour or more, the swap is free**, because the cache has expired and everything gets re-sent anyway. That's where TokenSaver saves the most.
+
+![Replayed on two developers' real Claude history: 23% and 14% cheaper. Quick questions save a tiny bit, medium sessions 5–10%, long sessions with breaks 25–45%.](docs/slides/7-numbers.png)
+
+**Replayed on real history:** the longer the session and the more breaks, the bigger the saving.
+
 ## How much it saves
 
 Measured on 51 real Claude Code sessions (one developer, mostly Opus):
@@ -75,7 +105,7 @@ tokensaver uninstall     # remove it completely
 
 ---
 
-## How it works
+## How it works, in detail
 
 Every time Claude Code talks to Claude, it sends **the whole conversation**
 again: every file Claude read, every command output, everything said so far.
