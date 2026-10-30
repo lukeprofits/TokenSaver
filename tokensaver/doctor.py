@@ -204,6 +204,9 @@ def _proxy_lines() -> list[str]:
                  f"audit={'on' if (h.get('audit') or {}).get('on') else 'off'}{stale}")
         if (h.get("audit") or {}).get("disabled"):
             L.append(f"    audit disabled: {h['audit']['disabled']}")
+        if h.get("thinking_rate"):
+            L.append(f"    thinking rate: {h['thinking_rate']['value']:.3f} tokens per signature char "
+                     f"({h['thinking_rate']['why']})")
     slot = ((config.load().get("settings") or {}).get("bg_compact") or {}).get("user") or {}
     if not config.get("bg_compact") and str(slot.get("why", "")).startswith("quality signals"):
         L.append(f"    COMPACTION TURNED ITSELF OFF ({slot.get('at')}): {slot['why']}")

@@ -62,11 +62,9 @@ from pathlib import Path
 from . import names
 from . import __version__, audit, background as bg, config, passes, pricing, sim, transcripts
 
-# Tokens per signature char when this machine can't measure (see thinking_factors).
-# 0.264: Opus 5.5, one exact sent request with the binding check passed, 2026-10-30
-# (Opus 5 measured 0.200, Sonnet 5 0.262 the same day). It replaced 0.14
-# (2026-10-22), measured without that check and so possibly on dropped thinking.
-DEFAULT_SIG_FACTOR = 0.264
+# Tokens per signature char when this machine can't measure (see thinking_factors):
+# the one default, kept with its history in background.TOKENS_PER_SIGNATURE_CHAR.
+DEFAULT_SIG_FACTOR = bg.TOKENS_PER_SIGNATURE_CHAR
 COUNT_URL = "https://api.anthropic.com/v1/messages/count_tokens"
 OUT_DIR = names.home() / "benchmark"
 
@@ -240,40 +238,32 @@ def _sent_requests(per_model: int = 4) -> dict[str, list[tuple[dict, int]]]:
 
 def _measure_sent(body: dict, sig: int, count: Counter) -> tuple[float | None, str]:
     """(tokens per signature char, "") on one exact sent request, or (None, why):
-    the API saying its thinking is not valid for these bytes means a count would lie."""
-    th = body.get("thinking")
-    if not isinstance(th, dict) or th.get("type") in (None, "disabled"):
-        return None, "thinking off in that request"
-    # Claude Code can put fields on a message (seen: `output_config`) that the
-    # Messages API accepts and count_tokens rejects ("Extra inputs are not
-    # permitted"). Counting keeps only role and content, on both counts alike.
-    # Likewise `thinking.display`: Claude Code sends "updates", count_tokens takes
-    # only "summarized" | "omitted". It shapes how the reply shows thinking, not
-    # what the request contains, so the counting copy leaves it out.
-    body = dict(body, messages=[{k: v for k, v in m.items() if k in ("role", "content")}
-                                if isinstance(m, dict) else m for m in body["messages"]])
-    th = {k: v for k, v in th.items() if k != "display"}
-    body["thinking"] = th
-    checked = dict(body, thinking=dict(th, block_binding={"prefix_mismatch_behavior": "error"}))
-    stripped = audit.payload(json.dumps(body).encode(), no_thinking=True)
-    (w, ew), (wo, ewo) = _pair(lambda b: count.count_body(b, BINDING_BETA), checked, stripped)
-    if not w or not wo:
-        return None, f"count refused: {(ew or ewo)[:90]}"
-    if w <= wo:
-        return None, "the thinking counted as 0 tokens"
-    r = (w - wo) / sig
-    if not FACTOR_BOUNDS[0] <= r <= FACTOR_BOUNDS[1]:
-        return None, f"implausible value {r:.3f}"
-    return r, ""
+    the same measurement the proxy makes continuously (`audit.measure_thinking`)."""
+    got = audit.measure_thinking(body, count.count_body)
+    return got["factor"], got["why"]
 
 
 def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict[str, dict]:
     """{model: {"value", "source": "sent" | "rebuilt" | "fallback", "n", "how"}}.
-    Source A (exact sent requests) first, then source B (requests rebuilt from
-    transcripts: fine for models without byte binding), then the fallback."""
+    First the proxy's own continuous measurements on this machine (enough of
+    them for that model), then source A (exact sent requests, measured now),
+    then source B (requests rebuilt from transcripts: fine for models without
+    byte binding), then the fallback."""
     out: dict[str, dict] = {}
     tried: dict[str, list[str]] = {}            # why sent requests did not measure, per model
+    models = {d.session.primary_model for d in sessions} | set(_sent_requests(per_model))
+    for model in models:
+        try:
+            v, why, info = audit.signature_factor(model)
+        except Exception:
+            continue
+        if info["source"] == "measured":
+            out[model] = {"value": v, "source": "continuous", "n": info["n"],
+                          "how": f"measured continuously on this machine: {info['n']} sent requests, "
+                                 f"{info['sessions']} sessions"}
     for model, items in _sent_requests(per_model).items():
+        if model in out:
+            continue
         results = [_measure_sent(b, s, count) for b, s in items]
         good = [r for r, _ in results if r is not None]
         tried[model] = [why for r, why in results if r is None]

@@ -1271,6 +1271,25 @@ def sim_factor() -> float:
     return _FACTOR["value"] or 0.92
 
 
+_SIG = {"at": 0.0, "value": None, "why": ""}
+
+
+def sig_factor() -> float:
+    """Tokens per thinking-signature character, fitted from this machine's own
+    measurements (`audit.signature_factor`, all models pooled: the size estimates
+    have no model), cached for 10 minutes. `background.size_tokens` reads it."""
+    if time.time() - _SIG["at"] > 600:
+        try:
+            _SIG["value"], _SIG["why"], _ = audit.signature_factor()
+        except Exception:
+            _SIG["value"], _SIG["why"] = background.TOKENS_PER_SIGNATURE_CHAR, "default (fit failed)"
+        _SIG["at"] = time.time()
+    return _SIG["value"] or background.TOKENS_PER_SIGNATURE_CHAR
+
+
+background.SIG_FACTOR = sig_factor
+
+
 def estimate(session: str) -> dict:
     """{"pct": saved if sent now, "next_pct"/"in_s": a bigger saving that a
     longer pause would unlock, "done": nothing left that waiting could improve},
@@ -1743,6 +1762,7 @@ class Handler(BaseHTTPRequestHandler):
             from . import __version__
             payload = json.dumps({"ok": True, "rewrite": REWRITE or "off",
                                   "bg_compact": BG_COMPACT, "audit": audit.status(),
+                                  "thinking_rate": {"value": round(sig_factor(), 4), "why": _SIG["why"]},
                                   "fallback": bool(_global_off()), "version": __version__,
                                   "pid": os.getpid(), "started": _STARTED,
                                   "inflight": _INFLIGHT[0], "code": _CODE_ID, "estimate": True,
@@ -2184,6 +2204,27 @@ def _prune_lines() -> list[str]:
     return out
 
 
+def thinking_rate_line() -> str:
+    """The thinking rate in use and where it comes from, per model measured."""
+    import sqlite3
+    value, why, _ = audit.signature_factor()
+    models = set()
+    try:
+        conn = sqlite3.connect(f"file:{vault.DB_PATH}?mode=ro", uri=True, timeout=5)
+        models = {json.loads(m or "{}").get("model") for (m,) in conn.execute(
+            "SELECT meta FROM events WHERE kind='thinking_factor'")} - {None}
+        conn.close()
+    except Exception:
+        pass
+    per = []
+    for m in sorted(models):
+        v, w, info = audit.signature_factor(m)
+        if info["source"] == "measured":
+            per.append(f"{m.replace('claude-', '')} {v:.3f} (n={info['n']})")
+    return (f"Thinking rate: {value:.3f} tokens per signature char, {why}"
+            + (f"; per model: {', '.join(per)}" if per else ""))
+
+
 def _token_lines() -> list[str]:
     """Real tokens from count_tokens samples, and behaviour after compaction."""
     import sqlite3
@@ -2203,6 +2244,10 @@ def _token_lines() -> list[str]:
         conn.close()
     except Exception:
         return out
+    try:
+        out.append(thinking_rate_line())
+    except Exception:
+        pass
     if legacy:
         out.append(f"({legacy} older counts left out: made before the thinking-fair count, they priced plain "
                    "Claude too low)")

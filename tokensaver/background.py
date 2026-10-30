@@ -145,13 +145,15 @@ def _json_list(text: str):
 
 # ---- history -----------------------------------------------------------------
 
-# Thinking signatures are long base64 but bill far less than chars/4: valid
-# thinking measured 0.14 tokens per signature character (a real session, 2026-10-22:
-# 23,803 tokens for 169,800 chars; count_tokens with and without thinking).
-# 2026-10-30: the benchmark measured Opus 5.5 at 0.264 on an exact sent request with
-# the binding check passed (one request; Opus 5 0.200, Sonnet 5 0.262). Not changed
-# here yet: this value steers the live proxy's compaction estimates (see the plan).
-TOKENS_PER_SIGNATURE_CHAR = 0.14
+# Thinking signatures are long base64 but bill far less than chars/4. The rate is
+# measured continuously on this machine (`audit.signature_factor`, fitted from the
+# requests TokenSaver sends); the proxy points SIG_FACTOR at that fit. This default
+# applies until there are enough measurements: Opus 5.5, one exact sent request
+# with the binding check passed, 2026-10-30 (Opus 5 0.200, Sonnet 5 0.262 that day).
+# It replaced 0.14 (2026-10-22, measured without the check, so possibly on thinking
+# the API had already dropped).
+TOKENS_PER_SIGNATURE_CHAR = 0.264
+SIG_FACTOR = lambda: TOKENS_PER_SIGNATURE_CHAR      # noqa: E731  replaced by the proxy
 
 
 def _signature_chars(x) -> int:
@@ -172,7 +174,7 @@ def size_tokens(messages: list) -> int:
     made old parts with much thinking look far bigger than they bill)."""
     sig = _signature_chars(messages)
     total = len(json.dumps(messages, ensure_ascii=False))
-    return round((total - sig) / CHARS_PER_TOKEN + sig * TOKENS_PER_SIGNATURE_CHAR)
+    return round((total - sig) / CHARS_PER_TOKEN + sig * SIG_FACTOR())
 
 
 def fingerprint(messages: list) -> str:
