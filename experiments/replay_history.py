@@ -89,7 +89,7 @@ def main() -> int:
     rows, t0 = [], time.time()
     for i, d in enumerate(sorted(data, key=lambda d: len(d.requests)), 1):
         stats = {"ml": 0, "markers": 0, "errors": 0}
-        f = factors.get(d.session.primary_model, (bm.DEFAULT_SIG_FACTOR, "assumed"))[0]
+        f = factors.get(d.session.primary_model, {"value": bm.DEFAULT_SIG_FACTOR})["value"]
         t = time.time()
         r = bm.replay(d, count, step, after_s, payback, f, transform=headroom_transform(profile, stats))
         r.update(session=hashlib.sha256(d.stem.encode()).hexdigest()[:8], **stats)

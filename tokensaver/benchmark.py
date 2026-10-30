@@ -24,9 +24,10 @@ decision with Anthropic's count_tokens endpoint (free; separate rate limit):
     + F x (thinking signature characters removed)
 
 F (thinking tokens per signature character) is measured on this machine's
-own requests where possible (counted with and without thinking), per model;
-otherwise the value measured on the author's machine (0.14) is used and the
-report says so. Between counted requests the removal is interpolated within
+own requests where possible (counted with and without thinking), per model:
+first on exact sent requests, then on rebuilt ones; otherwise the fallback
+`DEFAULT_SIG_FACTOR` is used, the report says so, and it shows how far a 30%
+error in it would move the result. Between counted requests the removal is interpolated within
 the same compaction epoch.
 
 Cost, the same model for both: a request reads the previous one's size from
@@ -61,7 +62,11 @@ from pathlib import Path
 from . import names
 from . import __version__, audit, background as bg, config, passes, pricing, sim, transcripts
 
-DEFAULT_SIG_FACTOR = 0.14        # tokens per signature char, measured on the author's machine
+# Tokens per signature char when this machine can't measure (see thinking_factors).
+# 0.264: Opus 5.5, one exact sent request with the binding check passed, 2026-10-30
+# (Opus 5 measured 0.200, Sonnet 5 0.262 the same day). It replaced 0.14
+# (2026-10-22), measured without that check and so possibly on dropped thinking.
+DEFAULT_SIG_FACTOR = 0.264
 COUNT_URL = "https://api.anthropic.com/v1/messages/count_tokens"
 OUT_DIR = names.home() / "benchmark"
 
@@ -117,6 +122,19 @@ class Counter:
     def __call__(self, model: str, messages: list, thinking: bool = False) -> int | None:
         body = audit.payload(json.dumps({"model": model, "messages": _countable(messages)}).encode(),
                              no_thinking=not thinking)
+        tokens, err = self.count_body(body)
+        if tokens is None:
+            self.errors[err] = self.errors.get(err, 0) + 1
+            self.failed += 1
+        return tokens
+
+    def count_body(self, body: dict, beta: str | None = None) -> tuple[int | None, str]:
+        """(input tokens, "") or (None, "<status> <message>") for a whole count_tokens
+        body. Errors are not tallied here: a caller probing validity expects some."""
+        headers = dict(self.headers)
+        if beta:
+            headers["anthropic-beta"] = ",".join(x for x in (headers.get("anthropic-beta"), beta) if x)
+        err = "no response"
         for attempt in range(5):
             with self.lock:
                 wait = self.last + self.gap - time.time()
@@ -124,11 +142,11 @@ class Counter:
                     time.sleep(wait)
                 self.last = time.time()
                 self.calls += 1
-            req = urllib.request.Request(COUNT_URL, data=json.dumps(body).encode(), headers=self.headers,
+            req = urllib.request.Request(COUNT_URL, data=json.dumps(body).encode(), headers=headers,
                                          method="POST")
             try:
                 with urllib.request.urlopen(req, timeout=90) as r:
-                    return json.loads(r.read())["input_tokens"]
+                    return json.loads(r.read())["input_tokens"], ""
             except urllib.error.HTTPError as e:
                 if e.code in (429, 500, 503, 529):
                     time.sleep(5 * (attempt + 1))
@@ -137,13 +155,10 @@ class Counter:
                     msg = (json.loads(e.read()).get("error") or {}).get("message", "")[:80]
                 except Exception:
                     msg = ""
-                key = f"{e.code} {msg}"
-                self.errors[key] = self.errors.get(key, 0) + 1
-                break
+                return None, f"{e.code} {msg}"
             except (urllib.error.URLError, TimeoutError, OSError):
                 time.sleep(5 * (attempt + 1))
-        self.failed += 1
-        return None
+        return None, err
 
 
 def _pair(fn, a, b):
@@ -157,11 +172,114 @@ def _pair(fn, a, b):
 
 # ---- thinking factor ----------------------------------------------------------
 
-def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict[str, tuple[float, str]]:
-    """{model: (tokens per signature char, "measured" | "assumed ...")}. Counted
-    with and without thinking on a few large requests per model. A transcript
-    whose bytes differ from what was sent invalidates its thinking (the API
-    then drops it, delta ~0); such a model falls back to the default."""
+# What the factor is: the tokens Anthropic bills for Claude's earlier reasoning
+# ("thinking"), per character of the signature it travels with. The benchmark
+# needs it for the thinking TokenSaver removes (the tail of a break-time trim);
+# the plain side is the transcript's real usage and never uses it.
+#
+# Measured by counting a request with and without its thinking. On Opus 5.5+
+# thinking counts only on the exact bytes first sent (system, tools and every
+# earlier message), so requests rebuilt from transcripts read ~0. Source A uses
+# the exact sent requests TokenSaver keeps (the stored request with the sent-
+# bytes ledger's messages: `_rewrite` changes only `messages`), and proves each
+# count included the thinking with the binding check set to "error".
+BINDING_BETA = "thinking-binding-controls-2026-08-01"
+MIN_SIG_CHARS = 20_000
+FACTOR_BOUNDS = (0.02, 0.5)
+
+
+def _sent_requests(per_model: int = 4) -> dict[str, list[tuple[dict, int]]]:
+    """{model: [(count_tokens body as sent, signature chars)]} from this machine's
+    TokenSaver history: each session's latest main request whose messages the
+    ledger holds. Read-only; nothing leaves the machine here."""
+    import sqlite3
+    from . import vault
+    out: dict[str, list] = {}
+    state = vault.VAULT_DIR / "proxy_state"
+    if not state.is_dir() or not vault.DB_PATH.exists():
+        return out
+    try:
+        conn = sqlite3.connect(f"file:{vault.DB_PATH}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return out
+    try:
+        for led_path in sorted(state.glob("*.bg.sent.json"), key=lambda p: -p.stat().st_mtime):
+            try:
+                sent = json.loads(led_path.read_text()).get("sent")
+            except (OSError, ValueError):
+                continue
+            if not isinstance(sent, list) or bg._signature_chars(sent) < MIN_SIG_CHARS:
+                continue
+            session = led_path.name[:-len(".bg.sent.json")]
+            for (eid,) in conn.execute("SELECT id FROM events WHERE kind='api_request' AND session_id=? "
+                                       "ORDER BY id DESC LIMIT 5", (session,)):
+                got = vault.read(eid)
+                meta = vault.read_meta(eid) or {}
+                if not got or meta.get("request_class") not in (None, "main") or meta.get("status") != 200:
+                    continue
+                rw = meta.get("rewrite") or {}
+                if rw.get("fallback") or rw.get("error") or meta.get("thinking_dropped"):
+                    break                       # this session's thinking is not known good
+                try:
+                    req = json.loads(got[1])
+                except ValueError:
+                    continue
+                if len(req.get("messages") or []) != len(sent):
+                    continue                    # not the request the ledger holds
+                body = audit.payload(json.dumps(dict(req, messages=sent)).encode())
+                model = req.get("model") or ""
+                if body and len(out.setdefault(model, [])) < per_model:
+                    out[model].append((body, bg._signature_chars(sent)))
+                break
+    except sqlite3.Error:
+        pass
+    finally:
+        conn.close()
+    return out
+
+
+def _measure_sent(body: dict, sig: int, count: Counter) -> tuple[float | None, str]:
+    """(tokens per signature char, "") on one exact sent request, or (None, why):
+    the API saying its thinking is not valid for these bytes means a count would lie."""
+    th = body.get("thinking")
+    if not isinstance(th, dict) or th.get("type") in (None, "disabled"):
+        return None, "thinking off in that request"
+    # Claude Code can put fields on a message (seen: `output_config`) that the
+    # Messages API accepts and count_tokens rejects ("Extra inputs are not
+    # permitted"). Counting keeps only role and content, on both counts alike.
+    # Likewise `thinking.display`: Claude Code sends "updates", count_tokens takes
+    # only "summarized" | "omitted". It shapes how the reply shows thinking, not
+    # what the request contains, so the counting copy leaves it out.
+    body = dict(body, messages=[{k: v for k, v in m.items() if k in ("role", "content")}
+                                if isinstance(m, dict) else m for m in body["messages"]])
+    th = {k: v for k, v in th.items() if k != "display"}
+    body["thinking"] = th
+    checked = dict(body, thinking=dict(th, block_binding={"prefix_mismatch_behavior": "error"}))
+    stripped = audit.payload(json.dumps(body).encode(), no_thinking=True)
+    (w, ew), (wo, ewo) = _pair(lambda b: count.count_body(b, BINDING_BETA), checked, stripped)
+    if not w or not wo:
+        return None, f"count refused: {(ew or ewo)[:90]}"
+    if w <= wo:
+        return None, "the thinking counted as 0 tokens"
+    r = (w - wo) / sig
+    if not FACTOR_BOUNDS[0] <= r <= FACTOR_BOUNDS[1]:
+        return None, f"implausible value {r:.3f}"
+    return r, ""
+
+
+def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict[str, dict]:
+    """{model: {"value", "source": "sent" | "rebuilt" | "fallback", "n", "how"}}.
+    Source A (exact sent requests) first, then source B (requests rebuilt from
+    transcripts: fine for models without byte binding), then the fallback."""
+    out: dict[str, dict] = {}
+    tried: dict[str, list[str]] = {}            # why sent requests did not measure, per model
+    for model, items in _sent_requests(per_model).items():
+        results = [_measure_sent(b, s, count) for b, s in items]
+        good = [r for r, _ in results if r is not None]
+        tried[model] = [why for r, why in results if r is None]
+        if good:
+            out[model] = {"value": sorted(good)[len(good) // 2], "source": "sent", "n": len(good),
+                          "how": f"measured on this machine: {len(good)} sent requests, thinking verified valid"}
     picks: dict[str, list] = {}
     for d in sessions:
         messages, reqs = transcripts.api_history(d.session.path)
@@ -171,20 +289,26 @@ def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict
         hist = transcripts.request_messages(messages, entry)
         sig = bg._signature_chars(hist)
         model = entry[1].model
-        if sig > 20_000 and len(picks.setdefault(model, [])) < per_model:
+        if model not in out and sig > MIN_SIG_CHARS and len(picks.setdefault(model, [])) < per_model:
             picks[model].append((hist, sig))
-    out = {}
     for model, items in picks.items():
         ratios = []
         for hist, sig in items:
             w, wo = _pair(lambda t: count(model, hist, thinking=t), True, False)
             if w and wo and w > wo:
                 ratios.append((w - wo) / sig)
-        good = [r for r in ratios if 0.02 <= r <= 0.5]
+        good = [r for r in ratios if FACTOR_BOUNDS[0] <= r <= FACTOR_BOUNDS[1]]
         if good:
-            out[model] = (sorted(good)[len(good) // 2], f"measured on {len(good)} requests")
+            out[model] = {"value": sorted(good)[len(good) // 2], "source": "rebuilt", "n": len(good),
+                          "how": f"measured on this machine: {len(good)} rebuilt requests"}
         else:
-            out[model] = (DEFAULT_SIG_FACTOR, "assumed (could not be measured here)")
+            out[model] = {"value": DEFAULT_SIG_FACTOR, "source": "fallback", "n": 0,
+                          "how": "fallback: TokenSaver's reference value; not measurable here"}
+    for model, whys in tried.items():
+        if whys and out.get(model, {}).get("source") != "sent":
+            fa = out.setdefault(model, {"value": DEFAULT_SIG_FACTOR, "source": "fallback", "n": 0,
+                                        "how": "fallback: TokenSaver's reference value"})
+            fa["how"] += f"; {len(whys)} sent request(s) tried: " + "; ".join(sorted(set(whys)))
     return out
 
 
@@ -202,15 +326,17 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     model = d.session.primary_model
     prices = [pricing.price_for(r.model) or d.price for r in reqs]
     removed_at: dict[int, int] = {}
+    sig_at: dict[int, int] = {}    # thinking signature chars TokenSaver removed (priced by `factor`)
     epochs: list[int] = []
     applied, epoch, decisions, applied_at = None, 0, 0, []
     failed = 0                     # counts Anthropic refused for this session
 
-    def removed(hist, ours) -> int | None:
+    def removed(hist, ours) -> tuple[int, int] | None:
         a, b = _pair(lambda m: count(model, m), hist, ours)
         if a is None or b is None:
             return None
-        return (a - b) + round(factor * (bg._signature_chars(hist) - bg._signature_chars(ours)))
+        sig = bg._signature_chars(hist) - bg._signature_chars(ours)
+        return (a - b) + round(factor * sig), sig
 
     last_epoch_start = 0
     for k, entry in enumerate(entries):
@@ -255,22 +381,27 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         if ours is not None:
             g = removed(hist, ours)
             if g is not None:
-                removed_at[k] = g
+                removed_at[k], sig_at[k] = g
             else:
                 failed += 1
 
-    rem = []
-    for k, ep in enumerate(epochs):
-        if k in removed_at:
-            rem.append(removed_at[k])
-            continue
-        before = [j for j in removed_at if j < k and epochs[j] == ep]
-        after = [j for j in removed_at if j > k and epochs[j] == ep]
-        if before and after:
-            a, b = max(before), min(after)
-            rem.append(round(removed_at[a] + (removed_at[b] - removed_at[a]) * (k - a) / (b - a)))
-        else:
-            rem.append(removed_at[max(before)] if before else removed_at[min(after)] if after else 0)
+    def fill(at: dict[int, int]) -> list[int]:
+        """One value per request: counted ones as is, the rest interpolated within the epoch."""
+        vals = []
+        for k, ep in enumerate(epochs):
+            if k in at:
+                vals.append(at[k])
+                continue
+            before = [j for j in at if j < k and epochs[j] == ep]
+            after = [j for j in at if j > k and epochs[j] == ep]
+            if before and after:
+                a, b = max(before), min(after)
+                vals.append(round(at[a] + (at[b] - at[a]) * (k - a) / (b - a)))
+            else:
+                vals.append(at[max(before)] if before else at[min(after)] if after else 0)
+        return vals
+
+    rem, sig_rem = fill(removed_at), fill(sig_at)
 
     def price(sizes, rebuilt) -> float:
         cost, prev = 0.0, None
@@ -283,6 +414,10 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
 
     plain = [r.context for r in reqs]
     ours = [max(s - x, 1) for s, x in zip(plain, rem)]
+    # The same result with the thinking factor 30% lower / higher (compaction
+    # decisions held fixed): how much the headline leans on that one number.
+    ours_lo = [max(o + round(0.3 * factor * s), 1) for o, s in zip(ours, sig_rem)]
+    ours_hi = [max(o - round(0.3 * factor * s), 1) for o, s in zip(ours, sig_rem)]
     real = sum((r.inp * p.inp + r.read * p.read + (r.write - r.write_5m) * p.write_1h
                 + r.write_5m * p.write_5m + r.out * p.out) / 1e6 for r, p in zip(reqs, prices))
     breaks = sum(1 for k in range(1, len(reqs)) if sim._ts(reqs[k].timestamp) - sim._ts(reqs[k - 1].timestamp) > after_s)
@@ -290,7 +425,9 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             "decisions": decisions, "compactions": len(applied_at), "count_failures": failed,
             "plain_tokens": sum(plain), "ours_tokens": sum(ours),
             "plain_cost": round(price(plain, set()), 4), "ours_cost": round(price(ours, set(applied_at)), 4),
-            "real_cost": round(real, 4)}
+            "ours_cost_factor_lo": round(price(ours_lo, set(applied_at)), 4),
+            "ours_cost_factor_hi": round(price(ours_hi, set(applied_at)), 4),
+            "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4)}
 
 
 # ---- the whole machine ------------------------------------------------------------
@@ -304,6 +441,15 @@ def _family(model: str) -> str:
         if f in model:
             return f
     return model or "?"
+
+
+def _version(model: str) -> str:
+    """'claude-opus-5-5' -> 'opus 5.5', 'claude-haiku-4-5-20251001' -> 'haiku 4.5': each
+    version is its own model, with its own behaviour and prices."""
+    parts = [p for p in (model or "?").split("-") if p != "claude" and not (p.isdigit() and len(p) == 8)]
+    name = [p for p in parts if not p.isdigit()]
+    nums = [p for p in parts if p.isdigit()]
+    return " ".join(name) + (" " + ".".join(nums) if nums else "") if name else (model or "?")
 
 
 def _bucket(n: int) -> str:
@@ -351,7 +497,7 @@ def summarize(rows: list[dict]) -> list[str]:
         lines.append(f"  {label:26s} {len(group):4d} sessions  {_pct(ot, pt):5.1f}% fewer tokens  "
                      f"{_pct(oc, pc):5.1f}% cheaper  (${pc:,.2f} -> ${oc:,.2f})")
     line("ALL", ok)
-    for title, key in (("by model", lambda r: _family(r["model"])), ("by length", lambda r: _bucket(r["requests"])),
+    for title, key in (("by model", lambda r: _version(r["model"])), ("by length", lambda r: _bucket(r["requests"])),
                        ("by compactions", lambda r: "no compaction" if not r["compactions"]
                         else "1 compaction" if r["compactions"] == 1 else "2+ compactions")):
         lines.append(f" {title}:")
@@ -361,6 +507,21 @@ def summarize(rows: list[dict]) -> list[str]:
         for g in sorted(groups):
             line(g, groups[g])
     return lines
+
+
+def factor_sensitivity(rows: list) -> list[str]:
+    """One line, only when some session priced its removed thinking with the fallback:
+    how far the headline would move if that value were 30% off either way."""
+    fb = [r for r in rows if r.get("factor_source") == "fallback" and r.get("thinking_chars_removed")]
+    if not fb:
+        return []
+    plain = sum(r["plain_cost"] for r in rows)
+    base = sum(r["ours_cost"] for r in rows)
+    lo = base - sum(r["ours_cost"] - r["ours_cost_factor_lo"] for r in fb)
+    hi = base - sum(r["ours_cost"] - r["ours_cost_factor_hi"] for r in fb)
+    spread = max(abs(_pct(lo, plain) - _pct(base, plain)), abs(_pct(hi, plain) - _pct(base, plain)))
+    return [f" thinking fallback used for {len(fb)} session(s): if {DEFAULT_SIG_FACTOR:.3f} were 30% off, "
+            f"\"cheaper\" would move by at most {spread:.1f} points"]
 
 
 def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | None = None) -> int:
@@ -389,22 +550,25 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
     after_s, payback = config.SPECS["bg_after_min"].default * 60, config.SPECS["bg_warm_payback_max"].default
     print("\nmeasuring thinking tokens per model...", flush=True)
     factors = thinking_factors(data, count)
-    for m, (f, how) in factors.items():
-        print(f"  {m}: {f:.3f} tokens per signature char ({how})")
+    for m, fa in factors.items():
+        print(f"  {_version(m)}: {fa['value']:.3f} tokens per signature char ({fa['how']})")
+    fallback = {"value": DEFAULT_SIG_FACTOR, "source": "fallback", "n": 0, "how": "fallback"}
     rows, t0 = [], time.time()
     for i, d in enumerate(sorted(data, key=lambda d: len(d.requests)), 1):
-        f = factors.get(d.session.primary_model, (DEFAULT_SIG_FACTOR, "assumed"))[0]
+        fa = factors.get(d.session.primary_model, fallback)
+        f = fa["value"]
         t = time.time()
         try:
             r = replay(d, count, step, after_s, payback, f)
         except Exception as exc:
             r = {"skipped": f"{type(exc).__name__}"}
         r["session"] = hashlib.sha256(d.stem.encode()).hexdigest()[:8]     # not the real id
+        r["factor_source"] = fa["source"]
         rows.append(r)
         if "skipped" in r:
             print(f"  [{i}/{len(data)}] skipped: {r['skipped']}", flush=True)
             continue
-        print(f"  [{i}/{len(data)}] {r['requests']:5d} requests, {_family(r['model']):6s} "
+        print(f"  [{i}/{len(data)}] {r['requests']:5d} requests, {_version(r['model']):10s} "
               f"{_pct(r['ours_tokens'], r['plain_tokens']):5.1f}% tokens  {_pct(r['ours_cost'], r['plain_cost']):5.1f}% cost  "
               f"compactions {r['compactions']}  ({time.time() - t:.0f}s)", flush=True)
     ok = [r for r in rows if "skipped" not in r]
@@ -416,13 +580,15 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
                  if count.errors else ""),
               # no same-quote nesting inside f-strings: Python before 3.12 (macOS's own 3.9) rejects it
-              " thinking: " + ", ".join(f"{_family(m)} {f:.3f} ({how.split()[0]})" for m, (f, how) in factors.items()),
+              " thinking: " + ", ".join(f"{_version(m)} {fa['value']:.3f} ({fa['source']})"
+                                        for m, fa in factors.items()),
               f" took {time.time() - t0:.0f}s"]
+    lines += factor_sensitivity(ok)
     lines += reliability(ok, count)
     print("\n".join(lines))
     report = {"tokensaver": __version__, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": step,
               "settings": {"bg_after_min": after_s / 60, "bg_warm_payback_max": payback},
-              "thinking_factors": {m: {"value": f, "how": how} for m, (f, how) in factors.items()},
+              "thinking_factors": factors,
               "counts": {"calls": count.calls, "failed": count.failed},
               "summary": lines[1:], "sessions": rows}
     OUT_DIR.mkdir(parents=True, exist_ok=True)

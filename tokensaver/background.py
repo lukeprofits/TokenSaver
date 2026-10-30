@@ -148,6 +148,9 @@ def _json_list(text: str):
 # Thinking signatures are long base64 but bill far less than chars/4: valid
 # thinking measured 0.14 tokens per signature character (a real session, 2026-10-22:
 # 23,803 tokens for 169,800 chars; count_tokens with and without thinking).
+# 2026-10-30: the benchmark measured Opus 5.5 at 0.264 on an exact sent request with
+# the binding check passed (one request; Opus 5 0.200, Sonnet 5 0.262). Not changed
+# here yet: this value steers the live proxy's compaction estimates (see the plan).
 TOKENS_PER_SIGNATURE_CHAR = 0.14
 
 
