@@ -1808,6 +1808,7 @@ class Handler(BaseHTTPRequestHandler):
                                   "fallback": bool(_global_off()), "version": __version__,
                                   "pid": os.getpid(), "started": _STARTED,
                                   "inflight": _INFLIGHT[0], "code": _CODE_ID, "estimate": True,
+                                  "keepalive": keepalive.held(),
                                   "strain": _STRAIN[-5:] + machine.recent_events()[-5:]}).encode()
             try:
                 self.send_response(200)

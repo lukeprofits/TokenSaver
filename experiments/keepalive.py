@@ -1,9 +1,10 @@
 """Would cache keep-alive bumps have paid on this machine's own history? Local, $0.
 
 Replays every real session (Claude Code's transcripts, forks excluded) with the
-rule TokenSaver ships (tokensaver/keepalive.py): after a request, a bump every
-BUMP_AFTER_S while before the learned day end (`keepalive.stop_hour`, from
-earlier days only: no lookahead), at most MAX_BUMPS per break, the daily cap
+rule TokenSaver ships (tokensaver/keepalive.py): in a big or returned-to
+session, a bump every BUMP_AFTER_S after a request, the first FREE_BUMPS at any
+hour, the rest (to MAX_BUMPS) only before the learned day end
+(`keepalive.stop_hour`, from earlier days only: no lookahead); the daily cap
 ignored. A bump costs a cache read of the context; a return while the bumps
 kept the cache alive saves a rewrite at the 1-hour price minus a read.
 
@@ -39,19 +40,25 @@ def main() -> int:
         for r in rq:
             bill += (r.inp * p.inp + r.read * p.read + r.write_1h * p.write_1h + r.write_5m * p.write_5m
                      + r.out * p.out) / 1e6
+        returned = False
         for k, r in enumerate(rq):
             t = sim._ts(r.timestamp)
             g = sim._ts(rq[k + 1].timestamp) - t if k + 1 < len(rq) else None
+            big = k + 1 >= ka.BIG_REQUESTS or returned or r.context >= ka.BIG_TOKENS
+            if g is not None and g > H:
+                returned = True
             if (g is None and now - t < 12 * H) or (g is not None and g <= H) or r.context < ka.MIN_TOKENS:
                 continue
             moments += 1
-            stop = ka.stop_hour(ends, t)
-            if stop is None:
+            if not big:
                 continue
+            stop = ka.stop_hour(ends, t)
             b, last = 0, t
             while b < ka.MAX_BUMPS:
                 bt = last + ka.BUMP_AFTER_S
-                if (g is not None and bt >= t + g) or ka._day(bt) != ka._day(t) or ka._hour(bt) >= stop:
+                if g is not None and bt >= t + g:
+                    break
+                if b >= ka.FREE_BUMPS and (stop is None or ka._day(bt) != ka._day(t) or ka._hour(bt) >= stop):
                     break
                 b, last = b + 1, bt
             cost = b * r.context * p.read / 1e6

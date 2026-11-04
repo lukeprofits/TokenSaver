@@ -219,13 +219,14 @@ pre-warming); nothing is generated and nothing is added to your conversation.
 
 So about 50 minutes into a break, TokenSaver can do that read for you, once an
 hour, for 2.5% of what losing the cache would cost. It only pays if you come
-back, so it learns when your day usually ends from your own history and stops
-before that: it never keeps a session warm overnight or over a weekend. It
-counts what it saved and spent, and turns itself off if it ever spends more
-than it saves.
+back. Most breaks (meetings, lunch) end within 1–3 hours, so it does the read
+twice after a break, keeps going only while it's before your usual end of day
+(learned from your own history), and never through the night. Only bigger
+sessions, or ones you've come back to before, get it. It counts what it saved
+and spent, and turns itself off if it ever spends more than it saves.
 
 On this project's own history (29 days) that would have cut the bill by about
-5% (`python3 experiments/keepalive.py` replays yours). It's off by default
+7% (`python3 experiments/keepalive.py` replays yours). It's off by default
 until it has been verified on real breaks; `tokensaver keepalive on` turns it
 on now. On a Pro or Max plan, these reads count toward your plan's usage.
 

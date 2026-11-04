@@ -32,6 +32,7 @@ class Base(unittest.TestCase):
         ka.STATE = self.tmp / "keepalive.json"
         ka._CACHED.update(at=0.0, st={})
         ka._SESSIONS.clear()
+        ka._COUNTS.clear()
         self.rec = mock.patch.object(ka.vault, "record").start()
         mock.patch.object(ka, "learn", side_effect=lambda: ka.load_state()).start()
 
@@ -103,10 +104,20 @@ class DueTest(Base):
         self.assertIn("too late", self.due(session(t), t + 59 * 60))
         self.assertIsNone(self.due(session(t, bumps=1, last_bump=t + 50 * 60), t + 100 * 60), "every 50 min")
 
-    def test_stops(self):
+    def test_two_bumps_at_any_hour_more_only_before_day_end(self):
         t = at(9, 15.5)
-        self.assertIn("end of the day", self.due(session(t), t + 50 * 60), "16:20 is after 16:00 (p75 17 - 1 h)")
-        self.assertIsNone(self.due(session(at(9, 14.5)), at(9, 14.5) + 50 * 60), "15:20 is before")
+        self.assertIsNone(self.due(session(t), t + 50 * 60), "bump 1 at 16:20: allowed after the day end")
+        self.assertIsNone(self.due(session(t, bumps=1, last_bump=t + 50 * 60), t + 100 * 60), "bump 2 too")
+        self.assertIn("end of the day", self.due(session(t, bumps=2, last_bump=t + 100 * 60), t + 150 * 60),
+                      "bump 3 only before 16:00 (p75 17 - 1 h)")
+        e = at(9, 12)
+        self.assertIsNone(self.due(session(e, bumps=2, last_bump=e + 100 * 60), e + 150 * 60), "14:30: before")
+        self.ends = {}
+        self.assertIn("learning", self.due(session(e, bumps=2, last_bump=e + 100 * 60), e + 150 * 60),
+                      "no history yet: only the first two")
+        self.assertIsNone(self.due(session(e), e + 50 * 60))
+
+    def test_stops(self):
         self.assertIn("cap", self.due(session(at(9, 12)), at(9, 12) + 50 * 60, spent=2.0))
         self.assertIn("bumps this break", self.due(session(at(9, 9), bumps=ka.MAX_BUMPS), at(9, 10)))
         self.assertEqual(self.due(session(at(9, 12), dropped="x"), at(9, 13)), "x")
@@ -207,7 +218,9 @@ class SettleTest(Base):
             self.assertFalse(ka.enabled(st)[0])
         with mock.patch.object(ka, "VERIFIED", True):
             self.assertTrue(ka.enabled(st)[0])
-            self.assertIn("learning", ka.enabled({"ends": {}})[1])
+            on, why = ka.enabled({"ends": {}})
+            self.assertTrue(on, "no history needed for the first two bumps")
+            self.assertIn("learns your hours", why)
 
     def test_nobody_came_back_is_wasted_and_auto_off(self):
         mock.patch.object(ka, "VERIFIED", True).start()
@@ -235,7 +248,13 @@ class SettleTest(Base):
         self.assertNotIn("s", ka._SESSIONS)
         ka.remember("s", "/v1/messages", b"{}", {"authorization": "Bearer X"}, time.time(),
                     {"cache_read_input_tokens": 50_000}, "claude-opus-5-5")
-        self.assertIn("s", ka._SESSIONS)
+        self.assertNotIn("s", ka._SESSIONS, "a new 50K session is not 'big': not held")
+        ka.remember("s", "/v1/messages", b"{}", {"authorization": "Bearer X"}, time.time(),
+                    {"cache_read_input_tokens": 200_000}, "claude-opus-5-5")
+        self.assertIn("s", ka._SESSIONS, "150K+ is big")
+        ka.remember("r", "/v1/messages", b"{}", {}, time.time() - 2 * H, {"cache_read_input_tokens": 50_000}, "m")
+        ka.remember("r", "/v1/messages", b"{}", {}, time.time(), {"cache_read_input_tokens": 50_000}, "m")
+        self.assertIn("r", ka._SESSIONS, "returned to after a break: big")
         config.set_value("cache_keepalive", "off", "user")
         ka.tick(running=lambda: True)
         self.assertEqual(ka._SESSIONS, {}, "off: the held login goes at the next tick")
@@ -243,7 +262,8 @@ class SettleTest(Base):
     def test_login_never_on_disk(self):
         config.set_value("cache_keepalive", "on", "user")
         ka.remember("s", "/v1/messages", b"{}", {"authorization": "Bearer SECRET-TOKEN"}, time.time(),
-                    {"cache_read_input_tokens": 50_000}, "claude-opus-5-5")
+                    {"cache_read_input_tokens": 200_000}, "claude-opus-5-5")
+        self.assertIn("s", ka._SESSIONS)
         ka.tick(running=lambda: True)
         for p in self.tmp.rglob("*"):
             if p.is_file():

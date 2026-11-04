@@ -10,10 +10,10 @@ request with `max_tokens: 0`: one read, 2.5% of a rewrite, and the cache
 lives another hour.
 
 It pays only if the user comes back to that session before the cache would
-have died anyway, so it bumps only before this user's usual end of day,
-learned from their own history (`DayEnd`): measured on 29 days, 115 idle
-moments, net +4.2% to +5.5% of the bill across every variant tried; with no
-day-end stop the bumps cost as much as they saved (experiments/keepalive.py).
+have died anyway. The rule (see FREE_BUMPS): two bumps after any break in a
+big or returned-to session, a few more only before this user's usual end of
+day, learned from their own history (`stop_hour`), never through the night.
+Replayed on 29 days, 115 breaks: +6.9% of the bill (experiments/keepalive.py).
 
 A warm return changes nothing else: break-time compaction still happens at
 its own swap points (the payback rule decides, as on any warm request).
@@ -43,7 +43,18 @@ from . import config, pricing, vault
 
 H = 3600
 BUMP_AFTER_S = 50 * 60       # the hour runs from the START of the last request; long replies eat into it
-MAX_BUMPS = 8                # per break
+# The rule (experiments/keepalive.py, 29 days, 115 breaks; same accounting for all):
+#   2 bumps after any break, at any hour, plus up to 4 more while before the usual day end,
+#   only for a session that is big or was returned to before:          +6.9% of the bill
+#   the earlier rule (day end only, max 8, any session):                 +5.3%
+#   bumping all night (20-24 per break):                         +0.1% / -0.7%
+# Most returns come 1-2.6 h later, which 2 bumps cover; a next-morning return needs 16-30
+# bumps (40-75% of the rewrite) and only about half of even the biggest sessions are picked
+# up the next morning, so nights lose every way it was sliced.
+FREE_BUMPS = 2               # per break, whatever the hour
+MAX_BUMPS = 6                # per break, the rest only before the usual day end
+BIG_REQUESTS = 50            # "big": this many requests, or returned to after a break before,
+BIG_TOKENS = 150_000         # or this much context (a session first seen after a proxy restart)
 MIN_TOKENS = 20_000          # below this a rewrite is cents
 WARMUP_DAYS = 5              # past days of use before auto bumps at all
 WEEKDAY_MIN = 4              # same-weekday samples before the weekday's own day end is used
@@ -66,6 +77,7 @@ MAX_SESSIONS = 20            # held in memory at once (each holds its last reque
 
 _LOCK = threading.Lock()
 _SESSIONS: dict[str, dict] = {}     # in memory only (holds auth)
+_COUNTS: dict[str, dict] = {}       # per session: requests seen, returned after a break before
 _STARTED = [False]
 UPSTREAM = [config.get("upstream")]
 
@@ -172,7 +184,7 @@ def enabled(st: dict | None = None) -> tuple[bool, str]:
         return False, "off until it is verified on a real break (`tokensaver keepalive on` to try it)"
     days = len(st.get("ends") or {})
     if days < WARMUP_DAYS:
-        return False, f"learning your hours ({days} of {WARMUP_DAYS} days)"
+        return True, f"on (auto; {FREE_BUMPS} bumps per break while it learns your hours: {days} of {WARMUP_DAYS} days)"
     return True, "on (auto)"
 
 
@@ -223,10 +235,19 @@ def remember(session: str | None, path: str, sent: bytes | None, headers: dict, 
                    ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
         with _LOCK:
             prev = _SESSIONS.get(session)
+            c = _COUNTS.setdefault(session, {"reqs": 0, "returned": False, "last": None})
+            if c["last"] is not None and started - c["last"] > H:
+                c["returned"] = True
+            c["reqs"] += 1
+            c["last"] = started
+            if len(_COUNTS) > 500:
+                for k in sorted(_COUNTS, key=lambda k: _COUNTS[k]["last"] or 0)[:100]:
+                    _COUNTS.pop(k, None)
+            big = c["reqs"] >= BIG_REQUESTS or c["returned"] or size >= BIG_TOKENS
         if prev and prev.get("bumps"):
             _settle_return(session, prev, usage, started)
         on, _ = enabled()
-        if not on or size < MIN_TOKENS:
+        if not on or size < MIN_TOKENS or not big:
             with _LOCK:
                 _SESSIONS.pop(session, None)
             return
@@ -291,11 +312,13 @@ def due(s: dict, now: float, ends: dict, spent_today: float, cap: float) -> str 
         return "not yet"
     if now - base > H - 120:
         return "too late: the cache may be gone"     # a bump then risks a full write
-    stop = stop_hour(ends, s["started"])
-    if stop is None and config.get("cache_keepalive") != "on":
-        return "still learning this user's hours"
-    if _day(now) != _day(s["started"]) or (stop is not None and _hour(now) >= stop):
-        return "past the usual end of the day"
+    if s["bumps"] >= FREE_BUMPS:
+        # Past the first two: only while before this user's usual end of the day.
+        stop = stop_hour(ends, s["started"])
+        if stop is None:
+            return "still learning this user's hours"
+        if _day(now) != _day(s["started"]) or _hour(now) >= stop:
+            return "past the usual end of the day"
     if spent_today >= cap:
         return f"daily cap ${cap:.2f} reached"
     return None
@@ -413,6 +436,14 @@ def tick(now: float | None = None, send=bump, running=_claude_running) -> list[s
             st3["today"] = {"day": _day(now), "spent": round(spent_today, 4)}
             _save_state(st3)
     return done
+
+
+def held() -> list[dict]:
+    """For the health check: which sessions may be bumped and when next. No login data."""
+    with _LOCK:
+        items = list(_SESSIONS.items())
+    return [{"session": k[:8], "size": s["size"], "bumps": s["bumps"], "dropped": s.get("dropped"),
+             "next_bump": round((s["last_bump"] or s["started"]) + BUMP_AFTER_S)} for k, s in items]
 
 
 def forget(session: str) -> None:
