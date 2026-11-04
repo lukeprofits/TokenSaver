@@ -143,14 +143,15 @@ and Anthropic. It doesn't use an AI model or an API key of its own.
 
 | what it does | typical saving |
 |---|---|
-| **Long scripts in commands.** When Claude runs a long inline script, the history keeps a short command pointing to an exact copy saved on your computer | the biggest one: commands about half the size, ~9% of the conversation |
 | **Duplicate plans.** Plan mode puts the same plan in the history twice; one copy is kept | ~3.5%, in sessions that use plan mode |
 | **JSON.** Compacts JSON output without losing anything | small for most people; a lot for JSON-heavy output |
 | **Clutter.** Removes color codes and trailing spaces | under 1% |
 | **Repeated lines.** A line repeated many times in a row becomes "this line, repeated N times" | helps on noisy logs |
 
-Together these save about 2% of the bill. Small, but it's on every message and
-loses nothing.
+Together these send about 1% less. Small, but it's on every message and loses
+nothing. (Shortening long inline scripts used to be part of this step. It was
+removed because Claude sometimes copied the short form and ran the wrong
+script.)
 
 ### Step 2: during long breaks (the big one)
 

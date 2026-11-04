@@ -19,8 +19,6 @@ testing, and anything not clearly safe is passed through untouched.
 
 from __future__ import annotations
 
-import hashlib
-import os
 import re
 import shlex
 from pathlib import Path
@@ -99,111 +97,9 @@ def wrap(command: str, tool_use_id: str) -> tuple[str, Path]:
     return f"{{ {command.rstrip().rstrip(';')} ; }} > >(tee -a {shlex.quote(str(log))}) 2>&1", log
 
 
-# Interpreters for which reading a script from stdin and reading it from a
-# file argument are equivalent. Shells are deliberately absent: `bash file`
-# runs a subshell so `cd` would stop persisting, and `. file` would let a
-# stray `exit` kill Claude Code's shell.
-HEREDOC_INTERPRETERS = ("python3", "python", "node", "ruby", "perl", "php")
-
-SCRIPT_DIR = vault.VAULT_DIR / "scripts"
-# Below this, the vault reference costs more than the body it replaces.
-MIN_BODY_CHARS = 600
-
-EXTENSIONS = {"python3": ".py", "python": ".py", "node": ".js",
-              "ruby": ".rb", "perl": ".pl", "php": ".php"}
-
-
-# A quoted heredoc anywhere in the command, with whatever precedes it on that
-# line. Only single-quoted tags: an unquoted tag lets the shell expand the body,
-# so moving those bytes to a file would change what actually runs.
-EMBEDDED_RE = re.compile(
-    r"(?P<pre>[^\n;&|]*?)<<\s*'(?P<tag>[A-Za-z_][A-Za-z0-9_]*)'[ \t]*\n"
-    r"(?P<body>.*?)\n(?P=tag)(?=\s|$)",
-    re.DOTALL,
-)
-INTERP_PRE = re.compile(r"(?P<interp>" + "|".join(HEREDOC_INTERPRETERS) +
-                        r")(?P<flags>(?:\s+-[A-Za-z]+)*)\s+-\s*$")
-# `cat > f`, `cat >> f`, `tee f`. The body ends up on disk, so the file itself
-# becomes the record and the command only needs to copy it there.
-FILEWRITE_PRE = re.compile(r"(?:cat|tee)\s*(?P<op>>>|>)\s*(?P<path>[^\s<>|&;]+)\s*$")
-
-
-def rewrite_command(command: str) -> tuple[str, list[dict]] | None:
-    """Replace large quoted heredoc bodies with vault references, in place.
-
-    Handles heredocs anywhere in the command, including mid-chain, which a
-    whole-command match (removed) could not: measured on real transcripts, the
-    whole-command form matched 1.3% of commands while quoted heredoc bodies
-    account for 53.8% of all Bash command characters.
-
-    Two shapes are rewritten, both losslessly:
-      `python3 - <<'PY' body PY`   -> `python3 <vault>/<sha>.py`
-      `cat > f <<'TAG' body TAG`   -> `cat <vault>/<sha>.txt > f`
-
-    Everything else is left exactly as written. Returns None if nothing
-    changed, so callers can pass the original through untouched.
-    """
-    out: list[str] = []
-    notes: list[dict] = []
-    pos = 0
-    for m in EMBEDDED_RE.finditer(command):
-        body = m.group("body")
-        pre = m.group("pre")
-        if len(body) < MIN_BODY_CHARS:
-            continue
-
-        interp_m = INTERP_PRE.search(pre)
-        file_m = None if interp_m else FILEWRITE_PRE.search(pre)
-        if not interp_m and not file_m:
-            continue
-
-        suffix = EXTENSIONS.get(interp_m.group("interp"), ".txt") if interp_m else ".txt"
-        try:
-            path = _store_script(body, suffix)
-        except OSError:
-            continue
-
-        if interp_m:
-            head = pre[:interp_m.start()]
-            flags = interp_m.group("flags") or ""
-            replacement = f"{head}{interp_m.group('interp')}{flags} {shlex.quote(str(path))}"
-        else:
-            head = pre[:file_m.start()]
-            replacement = (f"{head}cat {shlex.quote(str(path))} "
-                           f"{file_m.group('op')} {file_m.group('path')}")
-
-        out.append(command[pos:m.start()])
-        out.append(replacement)
-        pos = m.end()
-        notes.append({"path": str(path), "body_chars": len(body),
-                      "kind": "script" if interp_m else "filewrite"})
-
-    if not notes:
-        return None
-    out.append(command[pos:])
-    return "".join(out), notes
-
-
-def _store_script(body: str, suffix: str) -> Path:
-    """Content-addressed, byte-exact, idempotent.
-
-    The stored body gets the trailing newline back. A heredoc delivers its
-    body with the newline that precedes the terminator, but the regex captures
-    up to that newline and excludes it - so writing the stored bytes straight
-    out produced a file missing its final newline. Harmless for a Python
-    script, silent corruption for `cat > Foo.java`.
-    """
-    if not body.endswith("\n"):
-        body += "\n"
-    digest = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:16]
-    path = SCRIPT_DIR / f"{digest}{suffix}"
-    SCRIPT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if not path.exists():
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(body, encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        tmp.replace(path)
-    return path
+# Removed 2026-11-04: heredoc vaulting (`rewrite_command`), which replaced an inline
+# script with `python3 ~/.tokensaver/scripts/<sha>.py`. Claude imitated that short form
+# (see hook.py). Scripts already written stay in ~/.tokensaver/scripts.
 
 
 def read_capture(tool_use_id: str) -> str | None:

@@ -17,7 +17,7 @@ a heredoc script). Every pass must score 1.0 recoverable. (The pointer passes
 this once also measured were removed 2026-10-22; see passes.py.)
 
 Local only: reads ~/.claude/projects/*/*.jsonl. Zero API calls. Note the
-`heredocs` pass writes vaulted scripts to the TokenSaver vault.
+(The `heredocs` pass that wrote vaulted scripts was removed 2026-11-04.)
 """
 
 from __future__ import annotations

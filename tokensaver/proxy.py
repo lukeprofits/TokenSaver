@@ -634,6 +634,42 @@ def _commit(session: str, st: dict, pending: dict, messages: list, alias_choice:
     _bg_save(session, st)
 
 
+def _drop_stale_pending(st: dict, messages: list) -> bool:
+    """Drop a prepared compaction the history no longer matches. Caller holds _STATE_LOCK
+    and saves `st`. Returns whether it dropped one.
+
+    Found 2026-11-04: after Claude Code's /compact or a rewind, the applied compaction was
+    dropped but the pending one stayed. It then failed at every cold return ("history
+    changed since the compaction was made", 6 of 26), and `_prepare_due` measured growth
+    against its old size (1.55M tokens for a 15-message session), so the session never got
+    a compaction again. The prefix hash covers MBs, so it runs only when the history did
+    not simply grow: fewer messages than the last request (rewind, /compact) or a new
+    start. A rewind that still matches keeps the pending, rebased to the current size."""
+    pending = st.get("pending")
+    n, prev_n = len(messages), st.get("n_msgs")
+    start = _hist_fp(messages) if messages else None
+    st["n_msgs"], prev_start = n, st.get("bg_start")
+    st["bg_start"] = start
+    if not pending:
+        return False
+    cut = pending.get("cut")
+    grew = prev_n is not None and n >= prev_n and prev_start == start
+    if isinstance(cut, int) and cut < n and grew:
+        return False
+    if isinstance(cut, int) and 0 < cut < n and background.fingerprint(messages[:cut]) == pending.get("prefix_fp"):
+        if prev_n is not None and n < prev_n:                       # rewound, still matches
+            pending["total_tokens"] = min(int(pending.get("total_tokens") or 0) or 10 ** 12,
+                                          background.size_tokens(messages))
+        return False
+    st["pending"] = None
+    try:
+        vault.record("bg_dropped_pending", tool="proxy", index=False,
+                     summary=f"prepared compaction (cut {cut}) no longer matches the history ({n} messages)")
+    except Exception:
+        pass
+    return True
+
+
 def _bg(messages: list, session: str | None, skeleton: dict | None = None,
         headers: dict | None = None, decided: bool = False) -> tuple[list, dict]:
     """Apply a prepared compaction where it is free and already decided."""
@@ -653,6 +689,8 @@ def _bg(messages: list, session: str | None, skeleton: dict | None = None,
     with _STATE_LOCK:
         st = _bg_load(session)
         info: dict = {}
+        if _drop_stale_pending(st, messages):
+            info["bg_dropped_pending"] = True
         pending = st.get("pending")
         # The previous request's time: from memory, else from the state file,
         # so a proxy restart does not lose the moment. A session never seen

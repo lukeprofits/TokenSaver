@@ -1118,9 +1118,11 @@ def main() -> int:
         h_aux = dict(h_main, **{"x-claude-code-request-class": "auxiliary"})
         post(base + "/v1/messages", json.dumps(dict(body_obj, messages=aux)).encode(), h_aux)
         aux_sent = json.loads(RECEIVED[-1]["body"])["messages"]
+        # (message 2's repeated [INFO] lines are what the forward passes rewrite)
         check("auxiliary request with the main history gets the same rewritten prefix",
-              json.dumps(aux_sent[:2], sort_keys=True) == json.dumps(main_sent[:2], sort_keys=True)
-              and aux_sent[:2] != hist[:2],
+              json.dumps(proxy._canon(aux_sent[:3]), sort_keys=True)
+              == json.dumps(proxy._canon(main_sent[:3]), sort_keys=True)
+              and proxy._canon(aux_sent[:3]) != proxy._canon(hist[:3]),
               "it would write its own copy of the whole history to the cache")
         # Claude Code's real shape: the newest message is a one-block list with
         # cache_control in the main request, and a plain string in the side request.
@@ -1163,7 +1165,9 @@ def main() -> int:
                 {"type": "thinking", "thinking": "plan", "signature": "sig" * 20},
                 {"type": "tool_use", "id": f"t{n}", "name": "Bash", "input": {"command": script}}]}
 
-        def res(n, text="done"):
+        BUILD = "compiling module alpha\n" * 12 + "done"      # repeat_runs collapses this
+
+        def res(n, text=BUILD):
             return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"t{n}", "content": text}]}
         ask = {"role": "user", "content": [{"type": "text", "text": "fix the build"}]}
 
@@ -1189,7 +1193,7 @@ def main() -> int:
         send(fresh, "s22-new")
         s2, st2 = send([ask, run(1), res(1)], "s22-new")
         check("a session that started through the proxy is rewritten as before",
-              "<<'PY'" not in json.dumps(s2[1]) and not st2.get("adopted"), "the saving would be lost for everyone")
+              "repeats" in json.dumps(s2[2]) and not st2.get("adopted"), "the saving would be lost for everyone")
 
         # routing restored by the watchdog after this session's last proxied request
         _routing.state = lambda: {"managed": True, "on": True, "at": time.time() + 5}
@@ -1202,7 +1206,7 @@ def main() -> int:
         h4 = h3 + [run(4), res(4)]
         s4, st4 = send(h4, "s22-new")
         check("no gap: the newest reply is trimmed as usual",
-              "<<'PY'" not in json.dumps(s4[7]) and not st4.get("adopted"), "a stale restore time would stop saving")
+              "repeats" in json.dumps(s4[8]) and not st4.get("adopted"), "a stale restore time would stop saving")
 
         # Claude Code's own /compact: same history, the instruction added to the newest message
         hc = [ask, run(1), res(1), {"role": "user", "content": [{"type": "text", "text": "go on"}]}]

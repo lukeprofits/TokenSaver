@@ -3,18 +3,14 @@
 Two tiers, deliberately separated:
 
 * **capture** (default) - PostToolUse, PostToolUseFailure, PreCompact,
-  SessionStart, and PreToolUse. The first four only observe. PreToolUse does
-  one transformation: it moves a large quoted heredoc body into the vault and
-  shortens the command to reference it. That is verified byte-identical -
-  stdout, exit code and resulting files all match the original across
-  interpreter scripts, `cat >` and `cat >>` writes, nested paths and
-  multi-heredoc commands - and it is the only saving here that needs no cache
-  rebuild, so there is nothing to pay back.
+  SessionStart, and PreToolUse. They only observe. (PreToolUse used to move a
+  large heredoc body into the vault and shorten the command; removed
+  2026-11-04 because Claude imitated the short form, see hook.py.)
 
 * **output capture** (opt-in, env `TOKENSAVER_CAPTURE_OUTPUT=1`) - also wraps
   allowlisted test and build commands in a brace group with process
-  substitution so their full output is recorded. Materially more invasive than
-  vaulting a heredoc: it restructures the command. Guarded against heredocs,
+  substitution so their full output is recorded. It restructures the
+  command, so it is guarded against heredocs,
   process substitution, backgrounding, `exec`, unparseable quoting and
   watch flags, each added because that case broke in testing. Off by default.
 

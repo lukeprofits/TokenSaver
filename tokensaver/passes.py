@@ -5,11 +5,11 @@ These run over structured `Block`s (tool name, input, what came before) with one
 
 1. `plan_echo`: an ExitPlanMode result that repeats its own plan verbatim
    keeps one line naming the input that holds it.
-2. `heredocs`: the byte-exact command rewrite from `capture`.
-3. `json_compact`: lossless JSON re-encoding.
-4. `format`: cosmetic bytes in command output.
-5. `repeat_runs`: a run of identical consecutive output lines, collapsed with
+2. `json_compact`: lossless JSON re-encoding.
+3. `format`: cosmetic bytes in command output.
+4. `repeat_runs`: a run of identical consecutive output lines, collapsed with
    its count (lossless; replaced the lossy `dedup_noise` 2026-10-22).
+(`heredocs` was removed 2026-11-04: Claude imitated the shortened commands.)
 A fixed path alias plan (`hindsight_plan`/`plan_aliases`) can follow; the
 proxy decides it at a compaction on real counts.
 
@@ -32,8 +32,6 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable
-
-from . import capture
 
 
 @dataclass
@@ -282,31 +280,12 @@ def plan_echo(blocks: list[Block], state: State) -> list[Block]:
 
 ALIAS_NOTE_MARK = "TokenSaver path aliases"     # starts the plan's definition line
 
-HEREDOC_NOTE = ("[TokenSaver: this command's inline script was saved to the file it runs, to keep "
-                "the history short. Write new scripts inline as usual; the scripts folder holds only "
-                "scripts that already ran.]")
-
-
-def heredocs(blocks: list[Block], state: State) -> list[Block]:
-    """Byte-exact heredoc vaulting, as the live PreToolUse hook does it.
-
-    The history copy also gets HEREDOC_NOTE in the call's `description` (shown
-    to Claude, never executed). Without it Claude sometimes imitated the short
-    form it saw in its own history and ran a script path it had made up:
-    measured 7 of 5,820 Bash commands in one developer's history, 6 of them
-    files that did not exist (each a failed command and a retry)."""
-    for b in blocks:
-        if b.type == "tool_use" and b.tool == "Bash" and not b.fixed:
-            command = (b.input or {}).get("command")
-            if isinstance(command, str) and command in b.text:
-                rewritten = capture.rewrite_command(command)
-                if rewritten:
-                    desc = (b.input or {}).get("description")
-                    desc = f"{desc} {HEREDOC_NOTE}" if isinstance(desc, str) and desc else HEREDOC_NOTE
-                    b.out_input = dict(b.input, command=rewritten[0], description=desc)
-                    b.set_text(_tool_use_text(b.out_input), "heredocs")
-                    b.vaulted = True
-    return blocks
+# Removed 2026-11-04: `heredocs` (an inline script in Claude's own Bash call replaced by
+# `python3 ~/.tokensaver/scripts/<sha>.py` in the history copy). Claude imitated the short
+# form even with a note telling it not to: 13 of 5,708 Bash commands typed a scripts path
+# itself, 12 to files that did not exist (a failed command and a retry, each a full-context
+# request) and 1 that silently re-ran OLD code. It saved +0.77% on the requests it touched;
+# a quieter history is not worth a Claude that runs the wrong script.
 
 
 RUN_MIN_CHARS = 12       # a shorter line saves less than its marker costs
@@ -601,7 +580,6 @@ def plan_aliases(blocks: list[Block], plan: dict[str, str]) -> list[Block]:
 # within 84 chars of 52M on this history; the order is for correctness.
 FORWARD: tuple[tuple[str, Pass], ...] = (
     ("plan_echo", plan_echo),
-    ("heredocs", heredocs),
     ("json_compact", json_compact),
     ("format", format_output),
     ("repeat_runs", repeat_runs),
@@ -661,8 +639,7 @@ def verified(b: Block) -> bool:
     - json_compact: the compact form, with `_cols/_rows` expanded, parses to
       exactly the original JSON (numbers compared as written);
     - format / repeat_runs: expanding the runs gives back exactly the original
-      with only format's ANSI codes and trailing blanks removed;
-    - heredocs: the command changed only through the hook's own rewrite."""
+      with only format's ANSI codes and trailing blanks removed."""
     passes_used = set(b.removed_by)
     try:
         if "json_compact" in passes_used:
@@ -672,8 +649,6 @@ def verified(b: Block) -> bool:
         if passes_used & {"repeat_runs", "format"}:
             base = _TRAIL.sub("", _ANSI.sub("", b.original)) if "format" in passes_used else b.original
             return expand_runs(b.text) == base
-        if "heredocs" in passes_used:
-            return b.vaulted and b.out_input is not None
     except Exception:
         return False
     return True

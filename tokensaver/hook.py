@@ -87,27 +87,14 @@ def _pre_tool_use(payload: dict) -> dict:
     updated = dict(tool_input)
     changed = False
 
-    # 1. Shrink the command itself by vaulting large heredoc bodies. This is
-    #    the only transformation here with no downside at all: the short form
-    #    is what enters history, so there is no cache rebuild to pay back, and
-    #    the vaulted bytes are byte-identical to what the heredoc delivered.
-    #    Except in auto mode: the classifier sees the rewritten command, reads
-    #    `python3 ~/.tokensaver/scripts/<sha>.py` as running code from outside
-    #    the project, and denies it. Measured 2026-10-12: repeated "Code from
-    #    External" denials of our own edits. A blocked command is a worse
-    #    experience than a longer one, so auto mode keeps the original.
-    rewritten = (None if payload.get("permission_mode") == "auto"
-                 else capture.rewrite_command(command))
-    if rewritten:
-        command, notes = rewritten
-        updated["command"] = command
-        changed = True
-        vault.record("command_vaulted", content=command, tool="Bash",
-                     session_id=session, cwd=cwd,
-                     summary=f"vaulted {len(notes)} heredoc body(s)",
-                     meta={"scripts": notes, "tool_use_id": payload.get("tool_use_id")})
+    # Removed 2026-11-04: replacing an inline heredoc with `python3
+    # ~/.tokensaver/scripts/<sha>.py`. That short form entered Claude's real
+    # history, and Claude imitated it: 13 of 5,708 Bash commands typed a scripts
+    # path itself, 12 to files that did not exist and 1 that silently re-ran old
+    # code. (It was already off in auto mode, where the classifier denied it.)
+    # Scripts written before stay in ~/.tokensaver/scripts: old histories name them.
 
-    # 2. Separately, for allowlisted test/build commands, also capture full
+    # For allowlisted test/build commands, capture full
     #    output - Claude Code cuts a failing result to ~10k before any hook
     #    sees it, head-only, so the tail is otherwise unrecoverable.
     #    This one restructures the command with a brace group and process
