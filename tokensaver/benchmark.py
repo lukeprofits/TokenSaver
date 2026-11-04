@@ -53,6 +53,8 @@ import hashlib
 import json
 import os
 import platform
+import random
+import re
 import subprocess
 import sys
 import threading
@@ -100,65 +102,289 @@ def credentials() -> tuple[dict, str] | None:
     return {"authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"}, "Claude Code login"
 
 
+# ---- making a rebuilt history countable ------------------------------------------
+#
+# count_tokens checks a request the way the API does, but the benchmark sends no tool
+# list (the transcripts do not keep it). Two things in real histories then fail, measured
+# on a coworker's run (1,102 of 1,544 counts, 2026-11-04), and one failure repeats for
+# every later request of that session, since each one carries the same message:
+# - server-tool blocks (web search/fetch, MCP connector, code execution, ...: a
+#   `server_tool_use` and its `*_tool_result`): rejected without their tool and beta;
+# - a tool call without its result at the start of the next message: when Claude calls a
+#   server tool and a client tool in one turn, the server result arrives in the next
+#   assistant message, after the client result, and an Esc-interrupted call has none.
+# So every count goes through `countable`, which applies the same rules to both sides
+# (plain and TokenSaver), keeping the measured difference exact: unsupported blocks become
+# text holding their JSON, and every tool call gets its result right after it (moved from
+# later in the history, or a one-line placeholder when none was recorded).
+
+COUNTABLE_TYPES = {"text", "image", "document", "search_result", "tool_use", "tool_result",
+                   "thinking", "redacted_thinking"}
+PLACEHOLDER = "[no result recorded]"
+
+
+def _as_text(block: dict) -> dict:
+    body = {k: v for k, v in block.items() if k != "cache_control"}
+    return {"type": "text", "text": f"[{block.get('type')}] "
+            + json.dumps(body, ensure_ascii=False, separators=(",", ":"))}
+
+
+def _convert(block, rep: dict, strict: bool = False):
+    """One block made countable; nested tool_result content too."""
+    if not isinstance(block, dict):
+        return block
+    t = block.get("type")
+    if t == "tool_reference":
+        rep["converted"] = rep.get("converted", 0) + 1
+        return {"type": "text", "text": f"[tool {block.get('tool_name') or block.get('name') or ''}]"}
+    if t not in COUNTABLE_TYPES or (strict and t not in ("text", "tool_use", "tool_result")):
+        rep["converted"] = rep.get("converted", 0) + 1
+        return _as_text(block)
+    if strict:
+        # Only the basic fields: whatever extra field the counter refused goes into the text.
+        keep = {"text": ("type", "text"), "tool_use": ("type", "id", "name", "input"),
+                "tool_result": ("type", "tool_use_id", "content", "is_error")}[t]
+        extra = {k: v for k, v in block.items() if k not in keep and k != "cache_control"}
+        base = {k: block[k] for k in keep if k in block}
+        if t == "tool_result":
+            c = base.get("content")
+            if isinstance(c, list):
+                base["content"] = [x if isinstance(x, dict) and x.get("type") == "text" and set(x) <= {"type", "text"}
+                                   else _as_text(x) for x in c]
+        if extra:
+            rep["converted"] = rep.get("converted", 0) + 1
+            if t == "text":
+                base["text"] = base.get("text", "") + " " + json.dumps(extra, ensure_ascii=False, separators=(",", ":"))
+        return base
+    if t == "tool_result" and isinstance(block.get("content"), list):
+        return dict(block, content=[_convert(b, rep, strict) for b in block["content"]])
+    return dict(block)
+
+
+def _items(m: dict) -> list:
+    c = m.get("content")
+    return list(c) if isinstance(c, list) else [{"type": "text", "text": c if isinstance(c, str) else ""}]
+
+
+def countable(messages: list, strict: set | None = None) -> tuple[list, dict]:
+    """(a copy count_tokens accepts, {"converted", "moved", "placeholder", "stray"}).
+    `strict`: canonical-JSON hashes of messages to turn entirely into text (a 400 named them)."""
+    rep: dict = {}
+    out = []
+    for n, m in enumerate(messages):
+        s = bool(strict) and _msg_hash(m) in strict
+        out.append({"role": m.get("role"), "content": [_convert(b, rep, s) for b in _items(m)], "_src": n})
+    # Pairing: the results for an assistant message's tool calls lead the next user message.
+    i = 0
+    while i < len(out):
+        m = out[i]
+        if m["role"] != "assistant":
+            if m["role"] == "user":
+                prev_ids = ({b.get("id") for b in out[i - 1]["content"] if isinstance(b, dict) and b.get("type") == "tool_use"}
+                            if i and out[i - 1]["role"] == "assistant" else set())
+                fixed = []
+                for b in m["content"]:
+                    if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") not in prev_ids:
+                        rep["stray"] = rep.get("stray", 0) + 1
+                        b = _as_text(b)
+                    fixed.append(b)
+                m["content"] = fixed
+            i += 1
+            continue
+        ids = [b.get("id") for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if not ids:
+            i += 1
+            continue
+        if i + 1 >= len(out) or out[i + 1]["role"] != "user":
+            out.insert(i + 1, {"role": "user", "content": [], "_src": None})
+        nxt = out[i + 1]
+        have = {b.get("tool_use_id"): b for b in nxt["content"]
+                if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") in ids}
+        for tid in ids:
+            if tid in have:
+                continue
+            found = None
+            for j in range(i + 2, len(out)):
+                for k, b in enumerate(out[j]["content"]):
+                    if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") == tid:
+                        found = out[j]["content"].pop(k)
+                        break
+                if found:
+                    break
+            if found:
+                rep["moved"] = rep.get("moved", 0) + 1
+                have[tid] = found
+            else:
+                rep["placeholder"] = rep.get("placeholder", 0) + 1
+                have[tid] = {"type": "tool_result", "tool_use_id": tid, "content": PLACEHOLDER}
+        rest = [b for b in nxt["content"] if not (isinstance(b, dict) and b.get("type") == "tool_result"
+                                                  and b.get("tool_use_id") in have)]
+        nxt["content"] = [have[t] for t in ids] + rest
+        i += 1
+    # A message left empty by a move is not sent empty; `_src` (where each came from) is
+    # kept aside for the caller.
+    out = [m for m in out if m["content"]]
+    rep["_origin"] = [m.pop("_src") for m in out]
+    return out, rep
+
+
+def _msg_hash(m: dict) -> str:
+    return hashlib.sha1(json.dumps(m, sort_keys=True).encode()).hexdigest()
+
+
 def _countable(x):
-    """A copy count_tokens accepts without the session's tool list: a tool-search
-    reference becomes a text block naming the tool (the same on both sides)."""
-    if isinstance(x, list):
-        return [_countable(v) for v in x]
-    if isinstance(x, dict):
-        if x.get("type") == "tool_reference":
-            return {"type": "text", "text": f"[tool {x.get('tool_name') or x.get('name') or ''}]"}
-        return {k: _countable(v) for k, v in x.items()}
-    return x
+    """Back-compat: the countable copy only."""
+    if isinstance(x, list) and all(isinstance(m, dict) and "role" in m for m in x):
+        return countable(x)[0]
+    return _convert(x, {}) if isinstance(x, dict) else x
+
+
+BUILTIN_TOOLS = {"Bash", "BashOutput", "KillShell", "Read", "Edit", "MultiEdit", "Write", "Glob", "Grep",
+                 "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite", "NotebookEdit", "ExitPlanMode",
+                 "EnterPlanMode", "ToolSearch", "Skill", "AskUserQuestion", "Monitor", "LSP"}
+
+
+def shape(messages: list, index: int | None) -> list:
+    """Roles and block types around `index`, safe to share: no text, inputs or results;
+    tool names only for Claude Code's own tools ("mcp" / "other" otherwise)."""
+    if index is None:
+        return []
+    out = []
+    for j in range(max(0, index - 2), min(len(messages), index + 2)):
+        m = messages[j]
+        prev = messages[j - 1] if j else None
+        nxt = messages[j + 1] if j + 1 < len(messages) else None
+        blocks = []
+        for b in _items(m):
+            if not isinstance(b, dict):
+                continue
+            d = {"type": b.get("type")}
+            name = b.get("name")
+            if name:
+                d["tool"] = name if name in BUILTIN_TOOLS else ("mcp" if str(name).startswith("mcp__") else "other")
+            if b.get("type") == "tool_use":
+                d["result_next"] = bool(nxt) and any(isinstance(x, dict) and x.get("tool_use_id") == b.get("id")
+                                                     for x in _items(nxt))
+            if b.get("type") == "tool_result":
+                d["call_before"] = bool(prev) and any(isinstance(x, dict) and x.get("id") == b.get("tool_use_id")
+                                                      for x in _items(prev))
+            blocks.append(d)
+        out.append({"index": j, "role": m.get("role"), "blocks": blocks})
+    return out
+
+
+# ---- counting -----------------------------------------------------------------
+
+RATE_BUDGET_S = 15 * 60      # a count waits this long for a rate limit before it is given up
+_MSG_INDEX = re.compile(r"messages\.(\d+)")
 
 
 class Counter:
-    def __init__(self, auth: dict, rate_per_s: float = 5.0):
+    """count_tokens, paced and patient. Rate limits (429), overload (5xx) and network errors
+    are waited out: Anthropic's `retry-after` is honoured, the pace follows its
+    `anthropic-ratelimit-requests-*` headers (the limit is shared by everyone on one
+    account), and backoff has random jitter so many people do not retry in lockstep. Only
+    a count still blocked after RATE_BUDGET_S is given up, and it is reported as rate
+    limited, never mixed with a rejected request."""
+
+    def __init__(self, auth: dict, rate_per_s: float = 5.0, sleep=time.sleep):
         self.headers = dict(auth, **{"anthropic-version": "2023-06-01", "content-type": "application/json"})
-        self.gap, self.last, self.lock = 1.0 / rate_per_s, 0.0, threading.Lock()
-        self.calls = self.failed = 0
+        self.gap, self.next_at, self.lock, self.sleep = 1.0 / rate_per_s, 0.0, threading.Lock(), sleep
+        self.calls = self.failed = self.rate_limited = self.attempts = 0
         self.errors: dict[str, int] = {}
+        self.repairs: dict[str, int] = {}
+        self.repaired_sessions = 0
+        self.rejections: list[dict] = []
+        self.strict: set[str] = set()
 
     def __call__(self, model: str, messages: list, thinking: bool = False) -> int | None:
-        body = audit.payload(json.dumps({"model": model, "messages": _countable(messages)}).encode(),
-                             no_thinking=not thinking)
-        tokens, err = self.count_body(body)
-        if tokens is None:
-            self.errors[err] = self.errors.get(err, 0) + 1
+        self.calls += 1
+        for attempt in range(2):
+            fixed, rep = countable(messages, self.strict)
+            body = audit.payload(json.dumps({"model": model, "messages": fixed}).encode(),
+                                 no_thinking=not thinking)
+            tokens, err = self.count_body(body)
+            if tokens is not None:
+                for k, v in rep.items():
+                    if not k.startswith("_"):
+                        self.repairs[k] = self.repairs.get(k, 0) + v
+                return tokens
+            m = _MSG_INDEX.search(err)
+            if err.startswith("400") and m and attempt == 0:
+                # Turn the named message entirely into text for this and every later count.
+                idx = int(m.group(1))
+                origin = rep.get("_origin") or []
+                src = origin[idx] if idx < len(origin) else None
+                if src is not None and _msg_hash(messages[src]) not in self.strict:
+                    self.strict.add(_msg_hash(messages[src]))
+                    continue
+            break
+        if err.startswith("rate limited"):
+            self.rate_limited += 1
+        else:
             self.failed += 1
-        return tokens
+            self.errors[err] = self.errors.get(err, 0) + 1
+            m = _MSG_INDEX.search(err)
+            if len(self.rejections) < 5 and not any(r["error"] == err for r in self.rejections):
+                self.rejections.append({"error": err, "shape": shape(body["messages"], int(m.group(1)) if m else None)})
+        return None
+
+    def _pace(self, headers) -> None:
+        h = {k.lower(): v for k, v in (headers or {}).items()}
+        try:
+            rem = int(h.get("anthropic-ratelimit-requests-remaining"))
+        except (TypeError, ValueError):
+            return
+        reset = audit._parse_reset(h.get("anthropic-ratelimit-requests-reset"))
+        if reset is None:
+            return
+        left = max(reset - time.time(), 0.0)
+        # Spread what is left of the window evenly; with a few left, wait for the window.
+        spacing = left / rem if rem > 2 else left + 1
+        with self.lock:
+            self.next_at = max(self.next_at, time.time() + min(spacing, left + 1))
 
     def count_body(self, body: dict, beta: str | None = None) -> tuple[int | None, str]:
-        """(input tokens, "") or (None, "<status> <message>") for a whole count_tokens
-        body. Errors are not tallied here: a caller probing validity expects some."""
+        """(input tokens, "") or (None, "<status> <message>" | "rate limited ...")."""
         headers = dict(self.headers)
         if beta:
             headers["anthropic-beta"] = ",".join(x for x in (headers.get("anthropic-beta"), beta) if x)
-        err = "no response"
-        for attempt in range(5):
+        start, attempt, err = time.time(), 0, "no response"
+        while True:
             with self.lock:
-                wait = self.last + self.gap - time.time()
-                if wait > 0:
-                    time.sleep(wait)
-                self.last = time.time()
-                self.calls += 1
+                wait = max(self.next_at, 0) - time.time()
+                self.next_at = max(self.next_at, time.time()) + self.gap
+            if wait > 0:
+                self.sleep(wait)
+            self.attempts += 1
             req = urllib.request.Request(COUNT_URL, data=json.dumps(body).encode(), headers=headers,
                                          method="POST")
+            retry_after = None
             try:
                 with urllib.request.urlopen(req, timeout=90) as r:
+                    self._pace(r.headers)
                     return json.loads(r.read())["input_tokens"], ""
             except urllib.error.HTTPError as e:
-                if e.code in (429, 500, 503, 529):
-                    time.sleep(5 * (attempt + 1))
-                    continue
+                self._pace(e.headers)
+                if e.code not in (429, 500, 502, 503, 504, 529):
+                    try:
+                        msg = (json.loads(e.read()).get("error") or {}).get("message", "")[:200]
+                    except Exception:
+                        msg = ""
+                    return None, f"{e.code} {msg}"
+                err = f"rate limited ({e.code})" if e.code == 429 else f"rate limited (overloaded {e.code})"
                 try:
-                    msg = (json.loads(e.read()).get("error") or {}).get("message", "")[:80]
-                except Exception:
-                    msg = ""
-                return None, f"{e.code} {msg}"
-            except (urllib.error.URLError, TimeoutError, OSError):
-                time.sleep(5 * (attempt + 1))
-        return None, err
+                    retry_after = float(e.headers.get("retry-after"))
+                except (TypeError, ValueError):
+                    retry_after = None
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                err = f"rate limited (network: {type(e).__name__})"
+            attempt += 1
+            backoff = retry_after if retry_after is not None else min(60.0, 2.0 ** attempt)
+            backoff *= 1 + random.random() * 0.5               # jitter: not everyone at once
+            if time.time() - start + backoff > RATE_BUDGET_S:
+                return None, err
+            self.sleep(backoff)
 
 
 def _pair(fn, a, b):
@@ -489,8 +715,20 @@ def reliability(rows: list[dict], count) -> list[str]:
         k, v = max(count.errors.items(), key=lambda kv: kv[1])
         out.append(f"    Most common error ({v}x): {k[:150]}")
     out += ["    What to do: `tokensaver update`, then run the benchmark again. If this warning stays,",
-            "    please open an issue with the saved result file (numbers only, safe to share)."]
+            "    please send the saved result file: it lists the shape of each refused request (block",
+            "    types only, no text from your sessions), which is what is needed to fix it."]
     return out
+
+
+def rate_limit_warning(count) -> list[str]:
+    """Counts that could not get through Anthropic's rate limit even after waiting."""
+    if not count.rate_limited:
+        return []
+    return ["", f"*** {count.rate_limited:,} token counts were still rate limited after waiting "
+                f"{RATE_BUDGET_S // 60} minutes each.",
+            "    The rate limit is shared by everyone on your account (many people running the benchmark",
+            "    at once). Their sessions are estimated from the counts that got through; run it again later",
+            "    for a complete result."]
 
 
 def summarize(rows: list[dict]) -> list[str]:
@@ -627,10 +865,13 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         f = fa["value"]
         bg.MODEL.set(d.session.primary_model)
         t = time.time()
+        repaired_before = sum(count.repairs.values())
         try:
             r = replay(d, count, step, after_s, payback, f, prune=pruner)
         except Exception as exc:
             r = {"skipped": f"{type(exc).__name__}"}
+        if sum(count.repairs.values()) > repaired_before:
+            count.repaired_sessions += 1
         r["session"] = hashlib.sha256(d.stem.encode()).hexdigest()[:8]     # not the real id
         r["factor_source"] = fa["source"]
         rows.append(r)
@@ -649,18 +890,26 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
     lines += [f" cost model check: plain modelled ${pc:,.2f} vs your real bill ${rc:,.2f}",
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
-                 if count.errors else ""),
+                 if count.errors else "")
+              + (f", {count.rate_limited} gave up on a rate limit after waiting" if count.rate_limited else ""),
+              (" history repairs so Anthropic's counter accepts it (the same on both sides): "
+               + ", ".join(f"{v} {k}" for k, v in sorted(count.repairs.items()))
+               + f" in {count.repaired_sessions} sessions") if count.repairs else " history repairs: none needed",
               # no same-quote nesting inside f-strings: Python before 3.12 (macOS's own 3.9) rejects it
               " thinking: " + ", ".join(f"{_version(m)} {fa['value']:.3f} ({fa['source']})"
                                         for m, fa in factors.items()),
               f" took {time.time() - t0:.0f}s"]
     lines += factor_sensitivity(ok)
     lines += reliability(ok, count)
+    lines += rate_limit_warning(count)
     print("\n".join(lines))
     report = {"tokensaver": __version__, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": step, "mode": mode,
               "settings": {"bg_after_min": after_s / 60, "bg_warm_payback_max": payback},
               "thinking_factors": factors,
-              "counts": {"calls": count.calls, "failed": count.failed},
+              "counts": {"calls": count.calls, "failed": count.failed, "rate_limited": count.rate_limited,
+                         "attempts": count.attempts, "repairs": count.repairs,
+                         "repaired_sessions": count.repaired_sessions},
+              "rejections": count.rejections,
               "summary": lines[1:], "sessions": rows}
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     path = out or OUT_DIR / f"benchmark-{time.strftime('%Y%m%d-%H%M%S')}.json"

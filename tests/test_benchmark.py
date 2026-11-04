@@ -41,11 +41,12 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(sent[0]["content"][0]["text"], "summary")
 
     def test_tool_references_become_text_for_counting(self):
-        m = [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
+        m = [{"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "ToolSearch", "input": {}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
                                            "content": [{"type": "tool_reference", "tool_name": "WebSearch"}]}]}]
         out = benchmark._countable(m)
-        self.assertEqual(out[0]["content"][0]["content"][0], {"type": "text", "text": "[tool WebSearch]"})
-        self.assertEqual(m[0]["content"][0]["content"][0]["type"], "tool_reference", "original untouched")
+        self.assertEqual(out[1]["content"][0]["content"][0], {"type": "text", "text": "[tool WebSearch]"})
+        self.assertEqual(m[1]["content"][0]["content"][0]["type"], "tool_reference", "original untouched")
 
 
 class ReliabilityTest(unittest.TestCase):
