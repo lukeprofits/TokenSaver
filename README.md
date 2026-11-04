@@ -45,15 +45,21 @@ automatically. It runs on any computer, no AI model needed. You'll see a small
 
 ## How much it saves
 
-Measured on 51 real Claude Code sessions (one developer, mostly Opus):
+Replayed on 50 real Claude Code sessions (one developer, 28 days, mostly Opus;
+`tokensaver --benchmark`, 0 failed counts):
 
 | | plain Claude Code | with TokenSaver |
 |---|---|---|
-| tokens sent | 100% | **71%** (29% fewer) |
-| bill | 100% | **77%** (23% cheaper) |
-| bill, big working sessions | 100% | 73% (27% cheaper) |
-| bill, medium sessions | 100% | 93% (7% cheaper) |
+| tokens sent | 100% | **67%** (33% fewer) |
+| bill | 100% | **74%** (26% cheaper) |
+| bill, big working sessions | 100% | 70% (30% cheaper) |
+| bill, medium sessions | 100% | 92% (8% cheaper) |
 | bill, quick questions | 100% | about the same |
+
+That includes keeping the cache warm through breaks (bumps paid for, also for
+breaks nobody came back from) and leaves out local AI. On the 19 of those
+sessions that really ran through TokenSaver while it was still being built, the
+bill came out 12% lower as it ran.
 
 Session sizes here count every request Claude Code makes, and it makes one
 for each step: every file it reads, command it runs and edit it makes. So one
@@ -257,8 +263,8 @@ TokenSaver.
 
 | you see | it means |
 |---|---|
-| ⚡ 23% | Saving 23%, and break-time trimming is ready: a longer break will save more |
-| ⚡ 23% in green | Saving 23%, and that's as good as it gets for now |
+| ⚡ 26% | Saving 26%, and break-time trimming is ready: a longer break will save more |
+| ⚡ 26% in green | Saving 26%, and that's as good as it gets for now |
 | ⚡ with no number | Working, no measurement yet for this session |
 | ⚡ 0% | Nothing to trim yet (a new or short session), or TokenSaver is passing this session through untouched |
 | ⚡down in red | TokenSaver isn't answering. New sessions go straight to Anthropic; restart this one if it stops responding |
