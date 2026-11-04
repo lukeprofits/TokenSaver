@@ -210,7 +210,7 @@ tokensaver local-ai on     # download even with 100 GB or less free (never on a 
 tokensaver local-ai auto   # the default: only when both checks pass
 ```
 
-## Keeping the cache warm through breaks (being verified)
+## Keeping the cache warm through breaks
 
 Claude forgets its cached copy of your conversation an hour after it was last
 used. Come back from lunch and the next message pays to send the whole
@@ -237,11 +237,13 @@ It stays out of the way:
 - it counts what it saved and spent, and turns itself off if fewer breaks come
   back warm than it needs to break even.
 
-On this project's own history (28 days, interactive sessions only) it would
-have cut the bill by about 8% (`python3 experiments/keepalive.py` replays
-yours). It's off by default until it has been verified on real breaks;
-`tokensaver keepalive on` turns it on now. On a Pro or Max plan, these reads
-count toward your plan's usage.
+It's on by default, and each computer checks that it works there first: one
+read per break until a break comes back to a warm cache; if two breaks come
+back to a lost cache instead, it turns itself off. On this project's own
+history (28 days, interactive sessions only) it cut the bill by about 5% while
+checking and about 8% after (`python3 experiments/keepalive.py` replays yours;
+`tokensaver --benchmark` includes it). On a Pro or Max plan, these reads count
+toward your plan's usage.
 
 ```sh
 tokensaver keepalive        # on or off, when it stops today, what it saved and spent

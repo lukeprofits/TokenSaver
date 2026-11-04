@@ -24,7 +24,7 @@ from tokensaver import keepalive as ka, pricing, sim, transcripts  # noqa: E402
 H = 3600
 
 
-def main() -> int:
+def main(proven: bool = True) -> int:
     fk = sim.forks()
     ss = [s for s in transcripts.load() if s.requests and s.path.stem not in fk
           and ka.interactive(f"(external, {ka._entrypoint(s.path) or 'cli'})")]
@@ -53,18 +53,10 @@ def main() -> int:
             moments += 1
             if not big:
                 continue
-            stop = ka.stop_hour(ends, t)
-            b, last = 0, t
-            while b < ka.MAX_BUMPS:
-                bt = last + ka.BUMP_AFTER_S
-                if g is not None and bt >= t + g:
-                    break
-                if b >= ka.FREE_BUMPS and (stop is None or ka._day(bt) != ka._day(t) or ka._hour(bt) >= stop):
-                    break
-                b, last = b + 1, bt
+            b, warm = ka.replay_bumps(t, g, big, ends, proven_here=proven)
             cost = b * r.context * p.read / 1e6
             spent += cost
-            if b and g is not None and t + g <= last + H:
+            if warm:
                 saved += r.context * (p.write_1h - p.read) / 1e6
                 kept += 1
             elif b:
@@ -79,4 +71,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if "--unproven" in sys.argv:
+        print("(before it is proven on a machine: at most one bump per break)")
+    sys.exit(main(proven="--unproven" not in sys.argv))

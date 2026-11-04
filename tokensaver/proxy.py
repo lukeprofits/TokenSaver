@@ -2030,7 +2030,7 @@ class Handler(BaseHTTPRequestHandler):
                 keepalive.UPSTREAM[0] = UPSTREAM
                 keepalive.remember(session, self.path, sent, headers, started,
                                    getattr(self, "_usage", {}) or {}, getattr(self, "_model", None),
-                                   rate_limits)
+                                   rate_limits, bool((getattr(self, "_rewrite_stats", {}) or {}).get("bg_applied")))
         except Exception:
             pass
         try:

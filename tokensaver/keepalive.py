@@ -89,9 +89,13 @@ AUTO_OFF_MIN = 10            # bumped breaks before the break-even test (auto_of
 AUTO_OFF_DAYS = 14
 UPSTREAM_OK = ("https://api.anthropic.com",)
 STATE = vault.VAULT_DIR / "keepalive.json"
-# `auto` turns on only once a real bump has been seen to work (accepted with Claude Code's own
-# settings, read the cache, and the next request found it warm). Until then auto = off.
-VERIFIED = False
+# Each machine proves the mechanism itself, cheaply. Until a bump has been seen to keep a cache
+# alive here (a return after the hour that read the cache, or a second bump that still found
+# it), at most PROVE_BUMPS bump per break: "1 bump after every break" alone replayed at +5% of
+# the bill. Two clear failures before any proof (the bump read the cache, yet the return after
+# the hour had to write it again) turn it off: bumps do not keep the cache on this setup.
+PROVE_BUMPS = 1
+PROVE_FAILS = 2
 VALUE = None                 # set by the proxy: (session, size, model) -> dollars a warm return is worth
 TICK_S = 5
 MAX_SESSIONS = 20            # held at once (each holds its last request, a few MB)
@@ -144,6 +148,27 @@ def stop_hour(ends: dict, t: float) -> float | None:
     same = sorted(h for w, h in past.values() if w == _weekday(t))
     hours = same if len(same) >= WEEKDAY_MIN else sorted(h for _, h in past.values())
     return hours[int(DAY_END_Q * (len(hours) - 1))] - MARGIN_H
+
+
+def replay_bumps(t0: float, gap: float | None, big: bool, ends: dict, worth_it: bool = True,
+                 proven_here: bool = True) -> tuple[int, bool]:
+    """The rule above, replayed on history (the benchmark and experiments/keepalive.py use
+    this, so they measure exactly what runs): (bumps sent after a request at `t0` whose
+    session's next request came `gap` seconds later, or never (None); whether that return
+    found the cache warm). `worth_it` False: a trim would run on the return anyway."""
+    if not big or not worth_it:
+        return 0, False
+    stop = stop_hour(ends, t0)
+    limit = MAX_BUMPS if proven_here else PROVE_BUMPS
+    n, last = 0, t0
+    while n < limit:
+        bt = last + BUMP_AFTER_S
+        if (gap is not None and bt >= t0 + gap) or bt - t0 > HOLD_MAX_S:
+            break
+        if n >= FREE_BUMPS and (stop is None or _day(bt) != _day(t0) or _hour(bt) >= stop):
+            break
+        n, last = n + 1, bt
+    return n, gap is not None and n > 0 and gap > H and t0 + gap <= last + H
 
 
 def interactive(user_agent: str | None) -> bool:
@@ -243,14 +268,36 @@ def enabled(st: dict | None = None) -> tuple[bool, str]:
     st = _state_cached() if st is None else st
     if st.get("auto_off") and mode != "on":
         return False, f"off by itself: {st['auto_off']}"
-    if mode == "on":
-        return True, "on"
-    if not VERIFIED:
-        return False, "off until it is verified on a real break (`tokensaver keepalive on` to try it)"
+    tag = "on" if mode == "on" else "on (auto)"
+    if not proven(st):
+        fails = int((st.get("proof") or {}).get("fail") or 0)
+        return True, (f"{tag}; checking that it works here: {PROVE_BUMPS} bump per break until a break "
+                      f"comes back warm" + (f" ({fails} of {PROVE_FAILS} checks failed so far)" if fails else ""))
     days = len(st.get("ends") or {})
     if days < WARMUP_DAYS:
-        return True, f"on (auto; {FREE_BUMPS} bumps per break while it learns your hours: {days} of {WARMUP_DAYS} days)"
-    return True, "on (auto)"
+        return True, f"{tag}; {FREE_BUMPS} bumps per break while it learns your hours ({days} of {WARMUP_DAYS} days)"
+    return True, tag
+
+
+def proven(st: dict | None = None) -> bool:
+    return bool((st if st is not None else _state_cached()).get("proof", {}).get("ok"))
+
+
+def _prove(ok: bool) -> None:
+    """Record one piece of evidence that bumps do (or do not) keep the cache on this machine."""
+    with _LOCK:
+        st = load_state()
+        p = dict(st.get("proof") or {})
+        if ok:
+            p["ok"] = int(p.get("ok") or 0) + 1
+            p.setdefault("at", time.time())
+        elif not p.get("ok"):
+            p["fail"] = int(p.get("fail") or 0) + 1
+            if p["fail"] >= PROVE_FAILS:
+                st["auto_off"] = (f"bumps did not keep the cache on this setup ({p['fail']} breaks came back "
+                                  "to a lost cache after a bump that had read it)")
+        st["proof"] = p
+        _save_state(st)
 
 
 def bump_after(st: dict | None = None) -> int:
@@ -371,9 +418,10 @@ def eligible(path: str, sent: bytes, headers: dict, usage: dict, model: str | No
 
 
 def remember(session: str | None, path: str, sent: bytes | None, headers: dict, started: float,
-             usage: dict, model: str | None, rate_limits: dict | None = None) -> None:
+             usage: dict, model: str | None, rate_limits: dict | None = None, compacted: bool = False) -> None:
     """After a main request went through: settle the previous break, and keep what
-    a bump needs (memory only). Never raises."""
+    a bump needs (memory only). `compacted`: the proxy changed the history on this
+    request (it reads less by design, so it says nothing about the bumps). Never raises."""
     try:
         if not session or not sent:
             return
@@ -399,7 +447,13 @@ def remember(session: str | None, path: str, sent: bytes | None, headers: dict, 
             _WARM.pop(session, None)          # a real request: the proxy's own clock takes over
         if prev and prev.get("bumps"):
             read = int(usage.get("cache_read_input_tokens") or 0)
-            _record_break(session, prev, started, kept=read >= HIT_SHARE * prev["size"])
+            kept = read >= HIT_SHARE * prev["size"]
+            if not compacted:
+                _record_break(session, prev, started, kept=kept)
+                # Proof: back after the hour (the cache would have died without a bump) and
+                # within the last bump's hour. Read it: bumps work here. Wrote it again: they don't.
+                if started - prev["started"] > H and prev.get("last_bump") and started < prev["last_bump"] + H - 60:
+                    _prove(kept)
         on, _ = enabled()
         p = pricing.price_for(model or "")
         why = (None if on else "off") or (None if big else "not big") or (
@@ -473,6 +527,8 @@ def due(s: dict, now: float, ends: dict, spent_today: float, cap: float, after_s
         return "not yet"
     if now - base > H - _stop_margin(s):
         return "too late: the cache may be gone"
+    if not proven() and s["bumps"] >= PROVE_BUMPS:
+        return "one bump per break until it is proven to work here"
     if s["bumps"] >= FREE_BUMPS:
         # Past the first two: only while before this user's usual end of the day.
         stop = stop_hour(ends, s["started"])

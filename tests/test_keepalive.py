@@ -96,6 +96,7 @@ class DayEndTest(Base):
 class DueTest(Base):
     def setUp(self):
         super().setUp()
+        ka._update_state(proof={"ok": 1})       # proven here: the full rule applies
         self.ends = {ka._day(at(d, 17)): (ka._weekday(at(d, 17)), 17.0) for d in range(1, 9)}
 
     def due(self, s, now, spent=0.0, cap=2.0):
@@ -267,9 +268,8 @@ class BumpTest(Base):
         ka._update_state(today={})            # ... which the daily cap would also block; a new day
         config.set_value("cache_keepalive", "auto", "user")
         ka._SESSIONS["b"] = session(time.time() - 55.2 * 60)
-        with mock.patch.object(ka, "VERIFIED", True):
-            ka._CACHED.update(at=0.0)
-            self.tick()
+        ka._CACHED.update(at=0.0)
+        self.tick()
         self.assertIn("twice", ka.load_state()["auto_off"])
 
     def test_output_tokens_turn_it_off(self):
@@ -314,18 +314,39 @@ class BumpTest(Base):
 
 
 class SettleTest(Base):
-    def test_auto_waits_for_verification(self):
-        st = {"ends": {f"2026-10-0{d}": [d % 7, 17.0] for d in range(1, 9)}}
-        with mock.patch.object(ka, "VERIFIED", False):
-            self.assertFalse(ka.enabled(st)[0])
-        with mock.patch.object(ka, "VERIFIED", True):
-            self.assertTrue(ka.enabled(st)[0])
-            on, why = ka.enabled({"ends": {}})
-            self.assertTrue(on, "no history needed for the first two bumps")
-            self.assertIn("learns your hours", why)
+    def test_on_by_default_one_bump_until_proven(self):
+        config.set_value("cache_keepalive", "auto", "user")
+        on, why = ka.enabled({})
+        self.assertTrue(on, "on by default, with no history")
+        self.assertIn("checking that it works here", why)
+        t = time.time() - 2 * H
+        self.assertIsNone(ka.due(session(t), t + 58 * 60, {}, 0, 2, ka.BUMP_AFTER_S))
+        self.assertIn("proven", ka.due(session(t, bumps=1, last_bump=t + 58 * 60), t + 116 * 60, {}, 0, 2,
+                                       ka.BUMP_AFTER_S))
+
+    def test_a_warm_return_after_the_hour_proves_it(self):
+        self.on()
+        ka._SESSIONS["s"] = session(at(9, 12), bumps=1, spent=0.06, last_bump=at(9, 12) + 58 * 60)
+        self.remember(t=at(9, 12) + 80 * 60)                     # back at 1h20: only the bump explains a read
+        self.assertTrue(ka.proven(ka.load_state()))
+        self.assertIn("learns your hours", ka.enabled(ka.load_state())[1])
+
+    def test_two_lost_caches_after_a_bump_turn_it_off(self):
+        self.on()
+        lost = {"cache_read_input_tokens": 0, "cache_creation_input_tokens": 300_000}
+        for i in range(2):
+            ka._SESSIONS["s"] = session(at(9 + i, 12), bumps=1, spent=0.06, last_bump=at(9 + i, 12) + 58 * 60)
+            self.remember(t=at(9 + i, 12) + 80 * 60, usage=lost)
+        self.assertIn("did not keep the cache", ka.load_state()["auto_off"])
+
+    def test_a_compacted_return_proves_nothing(self):
+        self.on()
+        ka._SESSIONS["s"] = session(at(9, 12), bumps=1, spent=0.06, last_bump=at(9, 12) + 58 * 60)
+        ka.remember("s", "/v1/messages?beta=true", SENT, {"authorization": "Bearer SECRET", "User-Agent": UA},
+                    at(9, 12) + 80 * 60, {"cache_read_input_tokens": 20_000}, "claude-opus-5-5", None, True)
+        self.assertEqual(ka.load_state().get("proof"), None)
 
     def test_nobody_came_back_is_wasted_and_auto_off(self):
-        mock.patch.object(ka, "VERIFIED", True).start()
         config.set_value("cache_keepalive", "auto", "user")
         st = {"breaks": [{"t": time.time(), "session": "x", "bumps": 1, "spent": 0.08, "saved": 0.0,
                           "stake": 2.3, "kept": False, "misses": 0, "size": 1} for _ in range(90)]}

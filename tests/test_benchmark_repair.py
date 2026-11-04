@@ -187,10 +187,27 @@ class CounterTest(unittest.TestCase):
 
     def test_a_limit_that_never_clears_is_reported_as_rate_limited(self):
         Stub.plan = [429] * 50
-        with mock.patch.object(benchmark, "RATE_BUDGET_S", 0.05):
+        with mock.patch.object(benchmark, "SAMPLE_BUDGET_S", 0.05):
             c = benchmark.Counter({"x-api-key": "k"}, rate_per_s=1000)
             self.assertIsNone(c("claude-opus-5-5", [U(TXT("hi"))]))
         self.assertEqual((c.failed, c.rate_limited), (0, 1))
+        self.assertTrue(c.busy(), "optional samples are skipped for a while")
+
+    def test_a_deciding_count_waits_longer_than_a_sample(self):
+        waited = []
+        Stub.retry_after = "1"                       # longer than the sample budget below
+        try:
+            with mock.patch.object(benchmark, "SAMPLE_BUDGET_S", 0.5), \
+                    mock.patch.object(benchmark, "RATE_BUDGET_S", 100):
+                c = benchmark.Counter({"x-api-key": "k"}, rate_per_s=1000, sleep=waited.append)
+                Stub.plan = [429] * 3
+                self.assertIsNone(c("claude-opus-5-5", [U(TXT("hi"))]), "a sample gives up")
+                c = benchmark.Counter({"x-api-key": "k"}, rate_per_s=1000, sleep=waited.append)
+                Stub.plan = [429] * 3
+                self.assertIsNotNone(c("claude-opus-5-5", [U(TXT("hi"))], patient=True), "a deciding count waits")
+        finally:
+            Stub.retry_after = "0.01"
+        self.assertEqual(c.rate_limited, 0)
 
     def test_a_new_refusal_names_its_message_and_is_retried_as_text(self):
         Stub.strict_api = False
@@ -236,6 +253,50 @@ class CounterTest(unittest.TestCase):
         self.assertNotIn(secret, dumped)
         self.assertNotIn("corp", dumped, "MCP tool names are not shared")
         self.assertIn("tool_use", dumped)
+
+
+class KeepAliveReplayTest(unittest.TestCase):
+    """The benchmark replays keep-alive with the proxy's own rule: a lunch break kept warm
+    is a cache read instead of a rewrite, and every bump is paid for, including the ones
+    after the session's last request."""
+
+    def session(self):
+        import time as _t
+        from types import SimpleNamespace
+        from tokensaver import pricing
+        d = Path(tempfile.mkdtemp())
+        t0 = _t.mktime((2026, 10, 20, 9, 0, 0, 0, 0, -1))
+        rows, t = [], t0
+        for i in range(60):
+            t += 90 * 60 if i == 30 else 60                      # a 90-minute break in the middle
+            stamp = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(t))
+            rows.append({"type": "user", "timestamp": stamp, "message": {"role": "user", "content": f"step {i}"}})
+            rows.append({"type": "assistant", "timestamp": stamp, "message": {
+                "id": f"m{i}", "role": "assistant", "model": "claude-opus-5-5",
+                "content": [{"type": "text", "text": f"done {i}"}],
+                "usage": {"input_tokens": 2, "cache_read_input_tokens": 200_000, "output_tokens": 10,
+                          "cache_creation_input_tokens": 100,
+                          "cache_creation": {"ephemeral_1h_input_tokens": 100}}}})
+        path = d / "s.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows))
+        sess = SimpleNamespace(path=path, primary_model="claude-opus-5-5")
+        ends = {}
+        from tokensaver import keepalive as ka
+        for day in range(10, 20):                                # earlier days ending at 18:00
+            e = _t.mktime((2026, 10, day, 18, 0, 0, 0, 0, -1))
+            ends[ka._day(e)] = (ka._weekday(e), ka._hour(e))
+        return SimpleNamespace(session=sess, price=pricing.price_for("claude-opus-5-5"), stem="s"), ends
+
+    def test_a_kept_warm_break_is_cheaper_and_bumps_are_paid(self):
+        d, ends = self.session()
+        count = lambda model, msgs, **k: 1000 + len(json.dumps(msgs)) // 4
+        off = benchmark.replay(d, count, 8, 900, 70, 0.264)
+        on = benchmark.replay(d, count, 8, 900, 70, 0.264, keepalive_ends=ends)
+        self.assertEqual(on["keepalive_kept"], 1, "the 90-minute break came back to a warm cache")
+        self.assertGreaterEqual(on["keepalive_bumps"], 2, "one for the break, more after the last request")
+        self.assertGreater(on["keepalive_cost"], 0)
+        self.assertLess(on["ours_cost"], off["ours_cost"], "a rewrite of ~200K saved for a few reads")
+        self.assertEqual(on["plain_cost"], off["plain_cost"], "plain Claude Code has no keep-alive")
 
 
 if __name__ == "__main__":

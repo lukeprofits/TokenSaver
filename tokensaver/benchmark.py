@@ -35,6 +35,11 @@ cache unless the gap was over 1h or a compaction was just applied; the rest is
 written at 1h; output tokens are the real ones; each request at its own
 model's price. The plain side is printed next to the real bill as a check.
 
+Cache keep-alive is replayed with the proxy's own rule (`keepalive.replay_bumps`),
+once proven on the machine: kept-warm breaks are priced as reads, every bump is
+paid for (also after a session's last request), and trims follow the warm-return
+rule. Off when the user turned keep-alive off.
+
 Not modelled (each would move the result a little): re-reads of cut content
 (0 measured in a real trial). Fast mode (the default) also leaves out local AI
 (about 0.5-1% more where a machine runs it); `full` runs it on each compaction
@@ -275,7 +280,14 @@ def shape(messages: list, index: int | None) -> list:
 
 # ---- counting -----------------------------------------------------------------
 
-RATE_BUDGET_S = 15 * 60      # a count waits this long for a rate limit before it is given up
+# How long one count waits for a rate limit before it is given up. A sample (one request of
+# the session, the rest interpolated) waits a minute: on this machine counting every 8th request
+# instead of every one moved the result by ~0.1 point, so a few skipped samples cost little,
+# while waiting hours would make the benchmark useless. A count that DECIDES something (a
+# compaction) waits longer, since without it the replay could not decide at all.
+SAMPLE_BUDGET_S = 60
+RATE_BUDGET_S = 15 * 60
+BUSY_S = 120                 # after a sample gives up, skip optional samples this long
 _MSG_INDEX = re.compile(r"messages\.(\d+)")
 
 
@@ -290,20 +302,22 @@ class Counter:
     def __init__(self, auth: dict, rate_per_s: float = 5.0, sleep=time.sleep):
         self.headers = dict(auth, **{"anthropic-version": "2023-06-01", "content-type": "application/json"})
         self.gap, self.next_at, self.lock, self.sleep = 1.0 / rate_per_s, 0.0, threading.Lock(), sleep
-        self.calls = self.failed = self.rate_limited = self.attempts = 0
+        self.calls = self.failed = self.rate_limited = self.attempts = self.skipped_busy = 0
+        self.busy_until = 0.0
         self.errors: dict[str, int] = {}
         self.repairs: dict[str, int] = {}
         self.repaired_sessions = 0
         self.rejections: list[dict] = []
         self.strict: set[str] = set()
 
-    def __call__(self, model: str, messages: list, thinking: bool = False) -> int | None:
+    def __call__(self, model: str, messages: list, thinking: bool = False, patient: bool = False) -> int | None:
         self.calls += 1
+        budget = RATE_BUDGET_S if patient else SAMPLE_BUDGET_S
         for attempt in range(2):
             fixed, rep = countable(messages, self.strict)
             body = audit.payload(json.dumps({"model": model, "messages": fixed}).encode(),
                                  no_thinking=not thinking)
-            tokens, err = self.count_body(body)
+            tokens, err = self.count_body(body, budget=budget)
             if tokens is not None:
                 for k, v in rep.items():
                     if not k.startswith("_"):
@@ -321,6 +335,7 @@ class Counter:
             break
         if err.startswith("rate limited"):
             self.rate_limited += 1
+            self.busy_until = time.time() + BUSY_S       # ease off optional samples for a while
         else:
             self.failed += 1
             self.errors[err] = self.errors.get(err, 0) + 1
@@ -344,7 +359,12 @@ class Counter:
         with self.lock:
             self.next_at = max(self.next_at, time.time() + min(spacing, left + 1))
 
-    def count_body(self, body: dict, beta: str | None = None) -> tuple[int | None, str]:
+    def busy(self) -> bool:
+        """Anthropic's rate limit is saturated right now: optional samples are skipped."""
+        return time.time() < self.busy_until
+
+    def count_body(self, body: dict, beta: str | None = None,
+                   budget: float | None = None) -> tuple[int | None, str]:
         """(input tokens, "") or (None, "<status> <message>" | "rate limited ...")."""
         headers = dict(self.headers)
         if beta:
@@ -382,18 +402,31 @@ class Counter:
             attempt += 1
             backoff = retry_after if retry_after is not None else min(60.0, 2.0 ** attempt)
             backoff *= 1 + random.random() * 0.5               # jitter: not everyone at once
-            if time.time() - start + backoff > RATE_BUDGET_S:
+            if time.time() - start + backoff > (budget if budget is not None else RATE_BUDGET_S):
                 return None, err
             self.sleep(backoff)
 
 
-def _pair(fn, a, b):
+def _pair(fn, a, b, patient: bool = False):
+    """fn on both, in parallel. `patient`: the counter may wait longer for a rate limit
+    (the count decides something, e.g. a compaction, rather than being one sample of many)."""
+    if patient and _takes_patient(fn):
+        inner = fn
+        fn = lambda m: inner(m, patient=True)
     out = [None, None]
     t = threading.Thread(target=lambda: out.__setitem__(1, fn(b)))
     t.start()
     out[0] = fn(a)
     t.join()
     return out
+
+
+def _takes_patient(fn) -> bool:
+    import inspect
+    try:
+        return "patient" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 # ---- thinking factor ----------------------------------------------------------
@@ -543,12 +576,20 @@ def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict
 # ---- one session ----------------------------------------------------------------
 
 def replay(d, count: Counter, step: int, after_s: float, payback: float, factor: float,
-           transform=None, prune=None) -> dict:
+           transform=None, prune=None, keepalive_ends: dict | None = None) -> dict:
     """One session. `transform(k, hist) -> messages` replaces tokensaver's
     rewrite with another tool's (experiments use it for Headroom); then no
     compaction is emulated. `prune(cand, hist) -> cand` (`--benchmark full`)
     runs the local AI stages on each compaction the replay applies; the
-    decision to apply is made on the rules-only compaction, as the proxy does."""
+    decision to apply is made on the rules-only compaction, as the proxy does.
+    `keepalive_ends` (the user's day ends): cache keep-alive replayed with the
+    proxy's own rule (`keepalive.replay_bumps`): a break kept warm is priced as a
+    cache read and its trim decided as on a warm return; every bump is paid for,
+    including after a session's last request, where nobody came back."""
+    from . import keepalive as ka
+    kept_warm: set[int] = set()
+    bump_events: list[tuple[int, int]] = []     # (request the bumps followed, how many)
+    returned = False
     messages, entries = transcripts.api_history(d.session.path)
     if not entries:
         return {"skipped": "no billed requests"}
@@ -584,13 +625,14 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         else:
             if applied is not None and bg.apply(hist, applied) is None:
                 applied, epoch = None, epoch + 1
+            decided = None                     # (cand, s_now, s_new, reps) when a compaction was priced
             if k and gap > after_s and bg.worth_compacting(hist):
                 cand = bg.build(hist)
                 if cand and (applied is None or cand["cut"] > applied["cut"]):
                     cand = dict(cand, tail_end=len(hist))
                     now = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off")
                     new = passes.rewrite_messages(bg.apply(hist, cand), aliases="off")
-                    n_now, n_new = _pair(lambda m: count(model, m), now, new)
+                    n_now, n_new = _pair(lambda m: count(model, m), now, new, patient=True)
                     decisions += 1
                     if not (n_now and n_new):
                         failed += 1
@@ -601,13 +643,35 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                         s_now, s_new = n_now + floor, n_new + floor
                         p = prices[k]
                         reps = (s_new * p.write_1h - s_now * p.read) / max((s_now - s_new) * p.read, 1)
-                        if s_new < s_now and (gap > 3600 or reps <= payback):
-                            if prune is not None:
-                                cand = prune(cand, hist)
-                            applied, epoch = cand, epoch + 1
-                            applied_at.append(k)
+                        decided = (cand, s_now, s_new, reps)
+            cold = gap > 3600
+            if keepalive_ends is not None and k:
+                # The break before this request: would keep-alive have kept the cache, and at what cost?
+                big = k >= ka.BIG_REQUESTS or returned or reqs[k - 1].context >= ka.BIG_TOKENS
+                warm_trim = decided is not None and decided[2] < decided[1] and decided[3] <= payback
+                n, warm = ka.replay_bumps(sim._ts(reqs[k - 1].timestamp), gap, big, keepalive_ends,
+                                          worth_it=not warm_trim)
+                if n:
+                    bump_events.append((k - 1, n))
+                if warm:
+                    kept_warm.add(k)
+                    cold = False
+            if gap > 3600:
+                returned = True
+            if decided is not None:
+                cand, s_now, s_new, reps = decided
+                if s_new < s_now and (cold or reps <= payback):
+                    if prune is not None:
+                        cand = prune(cand, hist)
+                    applied, epoch = cand, epoch + 1
+                    applied_at.append(k)
             ours = None
-            if k % step == 0 or (applied_at and applied_at[-1] == k) or k == len(entries) - 1:
+            needed = (applied_at and applied_at[-1] == k) or k == len(entries) - 1 or k == 0
+            sample = k % step == 0
+            if sample and not needed and getattr(count, "busy", lambda: False)():
+                count.skipped_busy += 1           # the rate limit is saturated: interpolate this one
+                sample = False
+            if sample or needed:
                 ours = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off")
         epochs.append(epoch)
         if ours is not None:
@@ -635,14 +699,24 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
 
     rem, sig_rem = fill(removed_at), fill(sig_at)
 
-    def price(sizes, rebuilt) -> float:
+    if keepalive_ends is not None and transform is None:
+        # After the session's last request: bumps for someone who never came back (as it runs
+        # live while the session stays open; whether it was closed is not in the transcript).
+        last = len(reqs) - 1
+        big = len(reqs) >= ka.BIG_REQUESTS or returned or reqs[last].context >= ka.BIG_TOKENS
+        n, _ = ka.replay_bumps(sim._ts(reqs[last].timestamp), None, big, keepalive_ends)
+        if n:
+            bump_events.append((last, n))
+
+    def price(sizes, rebuilt, warm=frozenset(), bumps=()) -> float:
         cost, prev = 0.0, None
         for k, (r, size, p) in enumerate(zip(reqs, sizes, prices)):
             gap = sim._ts(r.timestamp) - sim._ts(reqs[k - 1].timestamp) if k else 0
-            hit = 0 if prev is None or gap > 3600 or k in rebuilt else min(prev, size)
+            hit = 0 if prev is None or (gap > 3600 and k not in warm) or k in rebuilt else min(prev, size)
             cost += (hit * p.read + (size - hit) * p.write_1h + r.out * p.out) / 1e6
             prev = size
-        return cost
+        # a bump reads the context its session had then
+        return cost + sum(n * sizes[i] * prices[i].read / 1e6 for i, n in bumps)
 
     plain = [r.context for r in reqs]
     ours = [max(s - x, 1) for s, x in zip(plain, rem)]
@@ -653,12 +727,20 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     real = sum((r.inp * p.inp + r.read * p.read + (r.write - r.write_5m) * p.write_1h
                 + r.write_5m * p.write_5m + r.out * p.out) / 1e6 for r, p in zip(reqs, prices))
     breaks = sum(1 for k in range(1, len(reqs)) if sim._ts(reqs[k].timestamp) - sim._ts(reqs[k - 1].timestamp) > after_s)
+    rebuilt = set(applied_at)
+    bump_cost = sum(n * ours[i] * prices[i].read / 1e6 for i, n in bump_events)
+    # What the kept-warm returns would otherwise have paid: the cached part written again.
+    kept_saved = sum(min(ours[k - 1], ours[k]) * (prices[k].write_1h - prices[k].read) / 1e6
+                     for k in kept_warm if k not in rebuilt)
     return {"requests": len(reqs), "model": model, "breaks": breaks, "counted": len(removed_at),
             "decisions": decisions, "compactions": len(applied_at), "count_failures": failed,
             "plain_tokens": sum(plain), "ours_tokens": sum(ours),
-            "plain_cost": round(price(plain, set()), 4), "ours_cost": round(price(ours, set(applied_at)), 4),
-            "ours_cost_factor_lo": round(price(ours_lo, set(applied_at)), 4),
-            "ours_cost_factor_hi": round(price(ours_hi, set(applied_at)), 4),
+            "plain_cost": round(price(plain, set()), 4),
+            "ours_cost": round(price(ours, rebuilt, kept_warm, bump_events), 4),
+            "ours_cost_factor_lo": round(price(ours_lo, rebuilt, kept_warm, bump_events), 4),
+            "ours_cost_factor_hi": round(price(ours_hi, rebuilt, kept_warm, bump_events), 4),
+            "keepalive_bumps": sum(n for _, n in bump_events), "keepalive_kept": len(kept_warm),
+            "keepalive_cost": round(bump_cost, 4), "keepalive_saved": round(kept_saved, 4),
             "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4)}
 
 
@@ -720,15 +802,31 @@ def reliability(rows: list[dict], count) -> list[str]:
     return out
 
 
+def keepalive_line(rows: list[dict], ends) -> str:
+    if ends is None:
+        return " cache keep-alive: off (not included)"
+    bumps = sum(r.get("keepalive_bumps", 0) for r in rows)
+    kept = sum(r.get("keepalive_kept", 0) for r in rows)
+    cost = sum(r.get("keepalive_cost", 0) for r in rows)
+    saved = sum(r.get("keepalive_saved", 0) for r in rows)
+    return (f" cache keep-alive (included above): {bumps} bumps kept {kept} breaks warm; "
+            f"spent ${cost:,.2f}, saved ~${saved:,.2f} in rewrites")
+
+
 def rate_limit_warning(count) -> list[str]:
-    """Counts that could not get through Anthropic's rate limit even after waiting."""
-    if not count.rate_limited:
+    """Counts estimated because Anthropic's rate limit was saturated: given up after waiting,
+    or skipped while it was busy. Interpolated from the counts around them (the same as the
+    requests a normal run does not count), so a few cost little; many are worth a rerun."""
+    est = count.rate_limited + getattr(count, "skipped_busy", 0)
+    if not est:
         return []
-    return ["", f"*** {count.rate_limited:,} token counts were still rate limited after waiting "
-                f"{RATE_BUDGET_S // 60} minutes each.",
-            "    The rate limit is shared by everyone on your account (many people running the benchmark",
-            "    at once). Their sessions are estimated from the counts that got through; run it again later",
-            "    for a complete result."]
+    share = est / max(count.calls + getattr(count, "skipped_busy", 0), 1)
+    out = ["", f" {est:,} token counts were estimated because Anthropic's rate limit was busy "
+               f"({count.rate_limited} gave up after waiting, {getattr(count, 'skipped_busy', 0)} skipped while busy)."]
+    if share > UNRELIABLE_SHARE:
+        out += [f"*** That is {100 * share:.0f}% of the counts: run the benchmark again later for a precise result.",
+                "    The limit is shared by everyone on your account (for example many people running it at once)."]
+    return out
 
 
 def summarize(rows: list[dict]) -> list[str]:
@@ -837,6 +935,14 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         if input("\nStart? [y/N] ").strip().lower() not in ("y", "yes"):
             return 1
     count = Counter(auth)
+    # Cache keep-alive is part of TokenSaver unless switched off: replayed with the proxy's
+    # own rule, on this user's day ends from their interactive sessions.
+    from . import keepalive as ka
+    ka_ends = None
+    if config.get("cache_keepalive") != "off":
+        ka_ends = ka.day_ends([sim._ts(r.timestamp) for d in data
+                               if ka.interactive(f"(external, {ka._entrypoint(d.session.path) or 'cli'})")
+                               for r in d.requests])
     pruner = None
     if mode == "full":
         import tempfile
@@ -867,7 +973,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         t = time.time()
         repaired_before = sum(count.repairs.values())
         try:
-            r = replay(d, count, step, after_s, payback, f, prune=pruner)
+            r = replay(d, count, step, after_s, payback, f, prune=pruner, keepalive_ends=ka_ends)
         except Exception as exc:
             r = {"skipped": f"{type(exc).__name__}"}
         if sum(count.repairs.values()) > repaired_before:
@@ -895,6 +1001,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               (" history repairs so Anthropic's counter accepts it (the same on both sides): "
                + ", ".join(f"{v} {k}" for k, v in sorted(count.repairs.items()))
                + f" in {count.repaired_sessions} sessions") if count.repairs else " history repairs: none needed",
+              keepalive_line(ok, ka_ends),
               # no same-quote nesting inside f-strings: Python before 3.12 (macOS's own 3.9) rejects it
               " thinking: " + ", ".join(f"{_version(m)} {fa['value']:.3f} ({fa['source']})"
                                         for m, fa in factors.items()),
