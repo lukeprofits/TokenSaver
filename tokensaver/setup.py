@@ -301,6 +301,24 @@ def local_ai_step(mode: str | None = None) -> Step:
     return Step("local-ai", status, what, apply if status == "todo" else None, notes)
 
 
+def old_scripts_step() -> Step | None:
+    """Scripts TokenSaver used to store for shortened commands (until 2026-11-04). Nothing uses
+    them now, and Claude sometimes ran one again from an old history, so they go: a copy of
+    such a command then fails instead of re-running old code."""
+    d = vault.VAULT_DIR / "scripts"
+    try:
+        n = sum(1 for p in d.iterdir() if p.is_file())
+    except OSError:
+        return None
+    if not n:
+        return None
+
+    def apply():
+        shutil.rmtree(d, ignore_errors=True)
+    return Step("scripts", "todo", f"delete {n} old saved scripts in {d} (no longer used; an old history "
+                                   "could re-run one)", apply)
+
+
 # ---- the plan -------------------------------------------------------------------
 
 def plan(route: str = "settings", shell_rc: str = "yes", audit: str | None = None, service: bool = True,
@@ -393,6 +411,9 @@ def plan(route: str = "settings", shell_rc: str = "yes", audit: str | None = Non
         steps.append(_alias_step(shell_rc, aliases))
 
     steps.append(local_ai_step(local_ai))
+    old = old_scripts_step()
+    if old:
+        steps.append(old)
     steps.append(statusline_step(statusbar))
     steps.append(Step("verify", "todo", "conformance suite (local, free) and the live health check",
                       lambda: verify(route)))

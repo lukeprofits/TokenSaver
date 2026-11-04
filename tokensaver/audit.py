@@ -256,7 +256,7 @@ def _count(path: str, headers: dict, body: dict) -> tuple[int | None, int, dict]
 # request once more with that one pass toggled (off if it was on, on if it was
 # off). A pass that changed nothing in a request costs no call. The proxy
 # switches a pass off for new free points when it measures as a net cost.
-ATTRIBUTE = ("repeat_runs", "format", "json_compact", "path_aliases")
+ATTRIBUTE = ("heredocs", "repeat_runs", "format", "json_compact", "path_aliases")
 CALLS_PER_JOB = 2 + len(ATTRIBUTE)
 
 

@@ -699,9 +699,9 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
 
     rem, sig_rem = fill(removed_at), fill(sig_at)
 
-    if keepalive_ends is not None and transform is None:
+    if keepalive_ends is not None and transform is None and not ka.closed_by_user(d.session.path):
         # After the session's last request: bumps for someone who never came back (as it runs
-        # live while the session stays open; whether it was closed is not in the transcript).
+        # live while the session stays open; a /clear or /exit closed it, so none then).
         last = len(reqs) - 1
         big = len(reqs) >= ka.BIG_REQUESTS or returned or reqs[last].context >= ka.BIG_TOKENS
         n, _ = ka.replay_bumps(sim._ts(reqs[last].timestamp), None, big, keepalive_ends)

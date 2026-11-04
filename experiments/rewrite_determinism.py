@@ -80,9 +80,14 @@ def only_allowed_changes(orig: dict, new: dict) -> str | None:
         if changed - allowed:
             return f"{x['type']} key changed: {sorted(changed - allowed)}"
         if x["type"] == "tool_use":
-            ci = {k for k in x["input"] if x["input"].get(k) != y["input"].get(k)}
-            allowed_in = {"command"}          # forward passes change a Bash command only
-            if ci - allowed_in or set(x["input"]) != set(y["input"]):
+            # Forward passes change a Bash command only; a command whose script was left out of
+            # the history (passes.heredocs) also gets a note in its description (added if absent).
+            omitted = "/dev/null/tokensaver-omitted/" in str(y["input"].get("command"))
+            allowed_in = {"command", "description"} if omitted else {"command"}
+            keys = set(y["input"]) - ({"description"} if omitted else set())
+            ci = {k for k in set(x["input"]) | set(y["input"]) if x["input"].get(k) != y["input"].get(k)}
+            if ci - allowed_in or set(x["input"]) - {"description"} != keys - {"description"} \
+                    or not set(x["input"]) <= set(y["input"]):
                 return f"tool_use input changed: {sorted(ci - allowed_in)}"
     return None
 

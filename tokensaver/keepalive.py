@@ -171,6 +171,19 @@ def replay_bumps(t0: float, gap: float | None, big: bool, ends: dict, worth_it: 
     return n, gap is not None and n > 0 and gap > H and t0 + gap <= last + H
 
 
+def closed_by_user(path) -> bool:
+    """The transcript ends with /clear or /exit: the session was closed, so live there are no
+    bumps after its last request (/clear starts a new session; 25 of 74 transcripts here)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 64_000))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return any(f"<command-name>/{c}</command-name>" in tail for c in ("clear", "exit"))
+
+
 def interactive(user_agent: str | None) -> bool:
     """Claude Code in a terminal or an IDE; not `claude -p`, the SDKs or CI ("sdk-*")."""
     m = re.search(r"\(external,\s*([^)]+)\)", user_agent or "")

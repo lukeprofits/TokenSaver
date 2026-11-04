@@ -5,11 +5,12 @@ These run over structured `Block`s (tool name, input, what came before) with one
 
 1. `plan_echo`: an ExitPlanMode result that repeats its own plan verbatim
    keeps one line naming the input that holds it.
-2. `json_compact`: lossless JSON re-encoding.
-3. `format`: cosmetic bytes in command output.
-4. `repeat_runs`: a run of identical consecutive output lines, collapsed with
+2. `heredocs`: a long inline script in Claude's own Bash call, left out of
+   the history copy behind a path that cannot run (copies fail, never run).
+3. `json_compact`: lossless JSON re-encoding.
+4. `format`: cosmetic bytes in command output.
+5. `repeat_runs`: a run of identical consecutive output lines, collapsed with
    its count (lossless; replaced the lossy `dedup_noise` 2026-10-22).
-(`heredocs` was removed 2026-11-04: Claude imitated the shortened commands.)
 A fixed path alias plan (`hindsight_plan`/`plan_aliases`) can follow; the
 proxy decides it at a compaction on real counts.
 
@@ -280,12 +281,69 @@ def plan_echo(blocks: list[Block], state: State) -> list[Block]:
 
 ALIAS_NOTE_MARK = "TokenSaver path aliases"     # starts the plan's definition line
 
-# Removed 2026-11-04: `heredocs` (an inline script in Claude's own Bash call replaced by
-# `python3 ~/.tokensaver/scripts/<sha>.py` in the history copy). Claude imitated the short
-# form even with a note telling it not to: 13 of 5,708 Bash commands typed a scripts path
-# itself, 12 to files that did not exist (a failed command and a retry, each a full-context
-# request) and 1 that silently re-ran OLD code. It saved +0.77% on the requests it touched;
-# a quieter history is not worth a Claude that runs the wrong script.
+# ---- heredocs: long inline scripts left out of the history copy -------------------
+#
+# The biggest forward pass on script-heavy work: measured 5.0% of all resent message chars
+# on 30 sessions (2026-11-04). Until that day the short form named a real stored copy
+# (`python3 ~/.tokensaver/scripts/<sha>.py`) and Claude sometimes typed such a path itself:
+# 13 of 5,708 Bash commands, 12 to files that did not exist and 1 that re-ran OLD code. So the
+# history copy now names a path that can never exist (`/dev/null` is a file, on macOS and
+# Linux), and no file is written: a copy Claude makes fails at once and loudly. For a file
+# write, `false &&` stops the shell before it applies the redirect, so a copy can never
+# truncate the target. Only the history copy changes; what ran was the full command.
+
+HEREDOC_INTERPRETERS = ("python3", "python", "node", "ruby", "perl", "php")
+HEREDOC_MIN_CHARS = 600            # below this the reference costs more than the body
+HEREDOC_EXT = {"python3": ".py", "python": ".py", "node": ".js", "ruby": ".rb", "perl": ".pl", "php": ".php"}
+OMITTED_DIR = "/dev/null/tokensaver-omitted"
+# Only single-quoted tags: with an unquoted tag the shell expands the body.
+_HEREDOC_RE = re.compile(r"(?P<pre>[^\n;&|]*?)<<\s*'(?P<tag>[A-Za-z_][A-Za-z0-9_]*)'[ \t]*\n"
+                         r"(?P<body>.*?)\n(?P=tag)(?=\s|$)", re.DOTALL)
+_INTERP_PRE = re.compile(r"(?P<interp>" + "|".join(HEREDOC_INTERPRETERS) + r")(?P<flags>(?:\s+-[A-Za-z]+)*)\s+-\s*$")
+_FILEWRITE_PRE = re.compile(r"(?:cat|tee)\s*(?P<op>>>|>)\s*(?P<path>[^\s<>|&;]+)\s*$")
+HEREDOC_NOTE = ("[TokenSaver: a long inline script was left out of this history to keep it short; it ran as "
+                "written. The path shown cannot run. Write scripts inline as usual.]")
+
+
+def omit_heredocs(command: str) -> str | None:
+    """The history form of `command` with each large quoted heredoc replaced by a
+    reference that cannot run, or None if nothing qualifies. Deterministic."""
+    import hashlib
+    out, pos, changed = [], 0, False
+    for m in _HEREDOC_RE.finditer(command):
+        body, pre = m.group("body"), m.group("pre")
+        if len(body) < HEREDOC_MIN_CHARS:
+            continue
+        sha = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:16]
+        interp = _INTERP_PRE.search(pre)
+        if interp:
+            ref = f"{OMITTED_DIR}/{sha}{HEREDOC_EXT.get(interp.group('interp'), '.txt')}"
+            repl = f"{pre[:interp.start()]}{interp.group('interp')}{interp.group('flags') or ''} {ref}"
+        else:
+            fw = _FILEWRITE_PRE.search(pre)
+            if not fw:
+                continue
+            repl = (f"{pre[:fw.start()]}false && cat {OMITTED_DIR}/{sha}.txt "
+                    f"{fw.group('op')} {fw.group('path')}")
+        out += [command[pos:m.start()], repl]
+        pos, changed = m.end(), True
+    return "".join(out) + command[pos:] if changed else None
+
+
+def heredocs(blocks: list[Block], state: State) -> list[Block]:
+    """Long inline scripts in Claude's own Bash calls, left out of the history copy (above)."""
+    for b in blocks:
+        if b.type == "tool_use" and b.tool == "Bash" and not b.fixed:
+            command = (b.input or {}).get("command")
+            if isinstance(command, str) and command in b.text:
+                short = omit_heredocs(command)
+                if short:
+                    desc = (b.input or {}).get("description")
+                    desc = f"{desc} {HEREDOC_NOTE}" if isinstance(desc, str) and desc else HEREDOC_NOTE
+                    b.out_input = dict(b.input, command=short, description=desc)
+                    b.set_text(_tool_use_text(b.out_input), "heredocs")
+                    b.vaulted = True
+    return blocks
 
 
 RUN_MIN_CHARS = 12       # a shorter line saves less than its marker costs
@@ -580,6 +638,7 @@ def plan_aliases(blocks: list[Block], plan: dict[str, str]) -> list[Block]:
 # within 84 chars of 52M on this history; the order is for correctness.
 FORWARD: tuple[tuple[str, Pass], ...] = (
     ("plan_echo", plan_echo),
+    ("heredocs", heredocs),
     ("json_compact", json_compact),
     ("format", format_output),
     ("repeat_runs", repeat_runs),
@@ -639,7 +698,8 @@ def verified(b: Block) -> bool:
     - json_compact: the compact form, with `_cols/_rows` expanded, parses to
       exactly the original JSON (numbers compared as written);
     - format / repeat_runs: expanding the runs gives back exactly the original
-      with only format's ANSI codes and trailing blanks removed."""
+      with only format's ANSI codes and trailing blanks removed;
+    - heredocs: the command is exactly `omit_heredocs` of the original."""
     passes_used = set(b.removed_by)
     try:
         if "json_compact" in passes_used:
@@ -649,6 +709,9 @@ def verified(b: Block) -> bool:
         if passes_used & {"repeat_runs", "format"}:
             base = _TRAIL.sub("", _ANSI.sub("", b.original)) if "format" in passes_used else b.original
             return expand_runs(b.text) == base
+        if "heredocs" in passes_used:
+            return (b.vaulted and b.out_input is not None
+                    and b.out_input.get("command") == omit_heredocs((b.input or {}).get("command") or ""))
     except Exception:
         return False
     return True
