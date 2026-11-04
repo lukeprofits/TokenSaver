@@ -47,7 +47,7 @@ def main() -> int:
             big = k + 1 >= ka.BIG_REQUESTS or returned or r.context >= ka.BIG_TOKENS
             if g is not None and g > H:
                 returned = True
-            if (g is None and now - t < 12 * H) or (g is not None and g <= H) or r.context < ka.MIN_TOKENS:
+            if (g is None and now - t < 12 * H) or (g is not None and g <= H) or r.context * (p.write_1h - p.read) / 1e6 < ka.MIN_SAVING_USD:
                 continue
             moments += 1
             if not big:

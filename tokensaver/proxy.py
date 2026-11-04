@@ -696,6 +696,11 @@ def _bg(messages: list, session: str | None, skeleton: dict | None = None,
         # so a proxy restart does not lose the moment. A session never seen
         # counts as warm: never pay to rebuild a cache that may be live.
         last = prev["last"] if prev is not None else st.get("last")
+        # A keep-alive bump that read the cache restarted its hour: measured from the
+        # bump, this return is warm, and nothing here may treat it as a free point.
+        warm = keepalive.last_warm(session)
+        if warm is not None and (last is None or warm > float(last)):
+            last = warm
         expired = last is not None and now - float(last) > BG_APPLY_AFTER_S
         if last is not None:
             info["gap_s"] = round(now - float(last))     # for the alias free-point check
@@ -1858,7 +1863,9 @@ class Handler(BaseHTTPRequestHandler):
                 pass      # the status-bar check gives up after 0.3 s; that is fine
             return
         if self.path.startswith("/_tokensaver/session/"):
-            payload = json.dumps(estimate(self.path.rsplit("/", 1)[-1])).encode()
+            sid = self.path.rsplit("/", 1)[-1]
+            keepalive.polled(sid)                 # the status line asks only for open sessions
+            payload = json.dumps(estimate(sid)).encode()
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1963,6 +1970,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         tee = _Tee()
+        try:
+            rate_limits = {k.lower(): v for k, v in response.headers.items()
+                           if k.lower().startswith("anthropic-ratelimit")}
+        except Exception:
+            rate_limits = {}
         content_type = response.headers.get("Content-Type", "")
         streaming = "text/event-stream" in content_type.lower()
         try:
@@ -1990,7 +2002,8 @@ class Handler(BaseHTTPRequestHandler):
                     and not self.headers.get("x-claude-code-agent-id")):
                 keepalive.UPSTREAM[0] = UPSTREAM
                 keepalive.remember(session, self.path, sent, headers, started,
-                                   getattr(self, "_usage", {}) or {}, getattr(self, "_model", None))
+                                   getattr(self, "_usage", {}) or {}, getattr(self, "_model", None),
+                                   rate_limits)
         except Exception:
             pass
         try:

@@ -98,6 +98,17 @@ def once(check=healthy) -> str:
     except Exception:
         pass
     try:
+        # Keep-alive learns this user's hours here, in its own process, so reading the
+        # transcripts never competes with the proxy's request threads.
+        from . import keepalive
+        kst = keepalive.load_state()
+        last = max(float(kst.get("learned_at") or 0), float(kst.get("learn_tried") or 0))
+        if time.time() - last > keepalive.LEARN_EVERY_S:
+            keepalive._update_state(learn_tried=time.time())   # a failing parse is not retried every 15 s
+            keepalive.learn()
+    except Exception:
+        pass
+    try:
         rs = routing.state()
         if not rs.get("managed"):
             return "not managing routing"

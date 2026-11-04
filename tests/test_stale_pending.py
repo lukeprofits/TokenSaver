@@ -72,5 +72,52 @@ class StalePendingTest(unittest.TestCase):
         self.assertTrue(proxy._drop_stale_pending(st, edited))
 
 
+class KeptWarmReturnTest(unittest.TestCase):
+    """A return after a keep-alive bump read the cache is warm: the proxy must not commit
+    a compaction as if the cache had died ("cache expired"), which would pay the write
+    the bump was there to avoid."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from tests.test_rules_only import history
+        from tokensaver import keepalive
+        self.keepalive = keepalive
+        self.dir = Path(tempfile.mkdtemp())
+        self.msgs = history()
+        pend = background.prepare(self.msgs[:-1])
+        self.assertIsNotNone(pend)
+        self.pend = dict(pend, made=1.0, total_tokens=10 ** 6)
+        mock.patch.object(proxy, "_bg_path", lambda s: self.dir / f"{s}.bg.json").start()
+        mock.patch.object(proxy.vault, "record").start()
+        mock.patch.object(proxy, "BG_COMPACT", True).start()
+        mock.patch.object(proxy, "_BG_STARTED", True).start()
+        mock.patch.object(proxy.audit, "enabled", return_value=False).start()
+        proxy._LIVE.pop("w", None)
+        keepalive._WARM.clear()
+
+    def tearDown(self):
+        mock.patch.stopall()
+        self.keepalive._WARM.clear()
+        proxy._LIVE.pop("w", None)
+
+    def run_return(self, warm_minutes_ago):
+        import time
+        now = time.time()
+        proxy._bg_save("w", {"pending": dict(self.pend), "last": now - 100 * 60,
+                             "n_msgs": len(self.msgs), "bg_start": proxy._hist_fp(self.msgs)})
+        if warm_minutes_ago is not None:
+            self.keepalive._WARM["w"] = now - warm_minutes_ago * 60
+        return proxy._bg(self.msgs, "w")[1]
+
+    def test_without_a_bump_the_cold_return_compacts(self):
+        self.assertTrue(self.run_return(None).get("bg_applied"))
+
+    def test_after_a_bump_it_is_warm(self):
+        info = self.run_return(42)
+        self.assertFalse(info.get("bg_applied"), "the bump kept the cache: no cold-cache compaction")
+        self.assertLess(info["gap_s"], 50 * 60, "the gap is measured from the bump")
+
+
 if __name__ == "__main__":
     unittest.main()
