@@ -772,7 +772,10 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             "keepalive_bumps": sum(n for _, n in bump_events), "keepalive_kept": len(kept_warm),
             "keepalive_cost": round(bump_cost, 4), "keepalive_saved": round(kept_saved, 4),
             "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4),
-            "through_tokensaver": through, **({"floor_tokens": floor_now()} if through else {})}
+            "through_tokensaver": through,
+            # what was billed, priced by the same cache model as plain (so the two compare fairly)
+            **({"floor_tokens": floor_now(),
+                "billed_model_cost": round(price([r.context for r in reqs], set()), 4)} if through else {})}
 
 
 # ---- the whole machine ------------------------------------------------------------
@@ -842,15 +845,13 @@ def measured_line(rows: list[dict]) -> str:
     plain = sum(r["plain_cost"] for r in ts)
     real = sum(r["real_cost"] for r in ts)
     ours = sum(r["ours_cost"] for r in ts)
-    # The real bill is billed, the plain one modelled: scale the model by how far it is from the
-    # real bill on the sessions that never went through TokenSaver (where both are plain).
-    others = [r for r in rows if not r.get("through_tokensaver")]
-    mp, mr = sum(r["plain_cost"] for r in others), sum(r["real_cost"] for r in others)
-    cal = mr / mp if mp > 0 and others else 1.0
-    return (f" {len(ts)} sessions already went through TokenSaver: you paid ${real:,.2f}, plain Claude Code "
-            f"would have been ~${plain * cal:,.2f} (rebuilt from the original messages"
-            + (f", the cost model scaled by {cal:.3f} to match your real bill" if others else "")
-            + f"): {_pct(real, plain * cal):.1f}% cheaper as it ran. Today's TokenSaver on them, replayed: "
+    # Both sides through the same cache model: what was billed (sizes TokenSaver sent) against the
+    # plain sizes rebuilt from the original messages. The real bill is shown beside it: where it is
+    # above the billed model, there were cache misses the model does not expect.
+    billed = sum(r.get("billed_model_cost") or r["real_cost"] for r in ts)
+    return (f" {len(ts)} sessions already went through TokenSaver: {_pct(billed, plain):.1f}% cheaper as it ran "
+            f"(${billed:,.2f} for what was sent vs ${plain:,.2f} plain, rebuilt from the original messages, "
+            f"the same cost model; you were billed ${real:,.2f}). Today's TokenSaver on them, replayed: "
             f"{_pct(ours, plain):.1f}% cheaper")
 
 

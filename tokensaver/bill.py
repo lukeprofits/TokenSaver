@@ -74,6 +74,22 @@ def _cost(p, inp: float, read: float, write: float, out: float, write_5m: float 
             + out * p.out) / 1e6
 
 
+def _starts_differently(rid, main_rid) -> bool:
+    """For side requests recorded before the proxy said why it left them alone: does the
+    stored body begin differently from the session's main request? (Bodies are kept 7 days;
+    without them this cannot be told, and the miss stays charged to TokenSaver.)"""
+    import json
+    if rid is None or main_rid is None:
+        return False
+    try:
+        a = json.loads(vault.read(rid)[1])["messages"][0]
+        b = json.loads(vault.read(main_rid)[1])["messages"][0]
+    except Exception:
+        return False
+    from .proxy import _canon
+    return _canon(a) != _canon(b)
+
+
 def compute(session_prefix: str = "", since: str = "") -> Bill:
     conn = sqlite3.connect(vault.DB_PATH)
     rows = conn.execute("SELECT id, ts, session_id FROM events WHERE kind='api_request' AND "
@@ -101,11 +117,12 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
         if p is None:
             continue
         rw = m.get("rewrite") if isinstance(m.get("rewrite"), dict) else {}
-        reqs.append((ts, session, m.get("request_class") or "main", u, rw, p))
+        reqs.append((ts, session, m.get("request_class") or "main", u, rw, p, rid))
 
     b = Bill()
     last: dict = {}            # session -> (time, plain size, sent size) of its last main request
-    for ts, session, cls, u, rw, p in reqs:
+    last_main_id: dict = {}
+    for ts, session, cls, u, rw, p, rid in reqs:
         inp = int(u.get("input_tokens") or 0)
         rd = int(u.get("cache_read_input_tokens") or 0)
         w = int(u.get("cache_creation_input_tokens") or 0)
@@ -130,9 +147,16 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
         warm = prev is not None and t - prev[0] < TTL_S
         cause = None
         if warm and w > MISS_TOKENS:
-            if cls != "main":
+            if cls not in ("main", "auxiliary", "compaction"):
+                # A subagent's own conversation: plain Claude Code writes that cache too.
+                cause = "Claude Code's separate conversation (subagent)"
+            elif cls != "main" and not rw and _starts_differently(rid, last_main_id.get(session)):
+                cause = "Claude Code's separate conversation (a side request that starts differently)"
+            elif cls != "main" and rw.get("aux_unmatched") == "separate":
+                cause = "Claude Code's separate conversation (a side request that starts differently)"
+            elif cls != "main":
                 cause = ("side request sent unrewritten (did not match the main history)"
-                         if not rw else "side request rewritten but missed")
+                         if not rw or rw.get("aux_unmatched") == "same" else "side request rewritten but missed")
             elif rw.get("bg_applied"):
                 cause = "compaction applied on a warm cache"
             elif prev and sent < 0.5 * prev[2]:
@@ -155,6 +179,12 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
             # assumes the previous request's prefix is read, as for plain.
             c_rd = rd if (cause or not warm) else min(prev[2], sent)
             last[session] = (t, plain_size, sent)
+            last_main_id[session] = rid
+        elif (rw.get("aux_unmatched") == "separate" or cls not in ("auxiliary", "compaction")
+              or (cause or "").startswith("Claude Code's separate")):
+            # A separate conversation TokenSaver never touched: plain Claude Code pays the same.
+            p_rd = rd
+            c_rd = rd
         else:
             p_rd = plain_size - inp - min(w, MISS_TOKENS // 25)
             c_rd = rd if cause else sent - inp - min(w, MISS_TOKENS // 25)

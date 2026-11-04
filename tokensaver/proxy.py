@@ -1165,11 +1165,55 @@ def _follows_main(session: str | None, messages: list) -> bool:
     Relayed raw, it could not share the main cache and its thinking failed the
     prefix check (240 blocks dropped in one /compact)."""
     main = _MAIN_HIST.get(session or "")
-    if not main or len(main) < 2 or not 0 <= len(messages) - len(main) <= AUX_EXTRA_MAX:
+    if not main:
+        return _follows_ledger(session, messages)
+    if len(main) < 2 or not 0 <= len(messages) - len(main) <= AUX_EXTRA_MAX:
         return False
     k = len(main) - 1
     return (json.dumps(_canon(messages[:k]), sort_keys=True)
             == json.dumps(_canon(main[:k]), sort_keys=True))
+
+
+def _follows_ledger(session: str | None, messages: list) -> bool:
+    """The same test against the main history's fingerprints on disk (the sent-bytes
+    ledger), for when the proxy has not seen this session's main request since it
+    started. Measured 2026-11-04: after proxy restarts, side requests that were exactly
+    the main history plus two messages went out unrewritten and wrote their own cache
+    (2 that day, $2.60), because the main history lived only in memory."""
+    if not session:
+        return False
+    led = _ledger(session)
+    old = (led or {}).get("fp") or []
+    if len(old) < 2:
+        return False
+    try:
+        peeked, _ = _bg_peek(messages, session)        # the ledger holds post-compaction messages
+    except Exception:
+        return False
+    if not 0 <= len(peeked) - len(old) <= AUX_EXTRA_MAX:
+        return False
+    k = len(old) - 1
+    return [_msg_fp(m) for m in peeked[:k]] == old[:k]
+
+
+def _same_start(session: str | None, messages: list) -> bool:
+    """Does this request begin like the session's main history (its first message)?"""
+    if not messages:
+        return False
+    main = _MAIN_HIST.get(session or "")
+    if main:
+        return _canon(main[0]) == _canon(messages[0])
+    old = ((_ledger(session) if session else None) or {}).get("fp") or []
+    return bool(old) and old[0] == _msg_fp(messages[0])
+
+
+def _lru_put(d: dict, key, value, limit: int = 20) -> None:
+    """Insert as the newest entry (a dict keeps insertion order; re-assigning an existing
+    key does not move it, which used to evict an active session first)."""
+    d.pop(key, None)
+    d[key] = value
+    while len(d) > limit:
+        d.pop(next(iter(d)))
 
 
 # ---- sent-bytes ledger: replay what was sent, never recompute it ------------
@@ -1218,7 +1262,7 @@ def _ledger(session: str) -> dict | None:
             led = json.loads(_ledger_path(session).read_text())
         except (OSError, ValueError):
             return None
-        _SENT[session] = led
+        _lru_put(_SENT, session, led)
     return led
 
 
@@ -1325,9 +1369,7 @@ def _replay(session: str, inp: list, out: list, epoch: str, update: bool = True,
         info["adopted"] = min(raw_until, len(out)) - k
     if update:
         led = {"epoch": epoch, "fp": fps, "sent": out, "t": time.time()}
-        _SENT[session] = led
-        if len(_SENT) > 20:
-            _SENT.pop(next(iter(_SENT)))
+        _lru_put(_SENT, session, led)
         try:
             p = _ledger_path(session)
             p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1614,8 +1656,13 @@ def _rewrite(body: bytes | None, path: str, request_class: str | None,
         try:
             request = json.loads(body)
             messages = request.get("messages") if isinstance(request, dict) else None
-            if not isinstance(messages, list) or not _follows_main(session, messages):
+            if not isinstance(messages, list):
                 return body, {}
+            if not _follows_main(session, messages):
+                # Why it was not rewritten decides who pays for its cache write (bill.py): a
+                # different conversation (message 0 is not the main's) is written by plain
+                # Claude Code too; the same one is a miss TokenSaver caused.
+                return body, {"aux_unmatched": "same" if _same_start(session, messages) else "separate"}
             if session in _FELL_BACK or _global_off():
                 return body, {}
             messages, stats = _bg_peek(messages, session)
@@ -1641,9 +1688,7 @@ def _rewrite(body: bytes | None, path: str, request_class: str | None,
         if not isinstance(messages, list):
             return body, {}
         if session:
-            _MAIN_HIST[session] = messages
-            if len(_MAIN_HIST) > 20:
-                _MAIN_HIST.pop(next(iter(_MAIN_HIST)))
+            _lru_put(_MAIN_HIST, session, messages)
         skeleton = {k: request[k] for k in ("model", "system", "tools", "tool_choice", "thinking")
                     if k in request}
         original = messages

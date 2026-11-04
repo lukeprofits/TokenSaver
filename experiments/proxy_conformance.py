@@ -1149,6 +1149,17 @@ def main() -> int:
         check("auxiliary requests do not touch session state",
               json.dumps(proxy._bg_load("sess-aux"), sort_keys=True) == st_before,
               "they would reset the idle timer that background compaction waits on")
+        # A proxy restart forgets the main history it holds in memory; the ledger on disk has it.
+        proxy._MAIN_HIST.clear()
+        proxy._SENT.clear()
+        post(base + "/v1/messages", json.dumps(dict(body_obj, messages=aux)).encode(), h_aux)
+        after = json.loads(RECEIVED[-1]["body"])["messages"]
+        check("after a proxy restart, a side request still shares the main rewrite",
+              json.dumps(after[:2], sort_keys=True) == json.dumps(aux_sent[:2], sort_keys=True),
+              "measured: side requests right after restarts wrote their own copy of the history ($2.60 in a day)")
+        st, info = proxy._rewrite(raw, "/v1/messages", "auxiliary", "sess-aux", dict(h_aux))
+        check("a side request for a different conversation is marked as such (plain Claude pays it too)",
+              info.get("aux_unmatched") == "separate" and st == raw, "the bill would charge it to TokenSaver")
     finally:
         proxy.REWRITE = ""
 
