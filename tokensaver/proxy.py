@@ -47,7 +47,7 @@ import urllib.request
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import audit, background, config, machine, passes, pricing, prune, vault
+from . import audit, background, config, keepalive, machine, passes, pricing, prune, vault
 
 # Settings come from `config`: the file, or env vars for a proxy started by
 # hand. A launchd-run proxy sees no shell env, so the file is the source.
@@ -1945,6 +1945,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         try:
+            # Keep what a cache keep-alive bump needs (memory only; see keepalive).
+            if (messages_call and status == 200 and session
+                    and (self.headers.get("x-claude-code-request-class") or "main") == "main"
+                    and not self.headers.get("x-claude-code-agent-id")):
+                keepalive.UPSTREAM[0] = UPSTREAM
+                keepalive.remember(session, self.path, sent, headers, started,
+                                   getattr(self, "_usage", {}) or {}, getattr(self, "_model", None))
+        except Exception:
+            pass
+        try:
             # Queue only; the count happens on audit's own thread, later.
             audit.offer(path=self.path, request_class=self.headers.get("x-claude-code-request-class"),
                         session=self.headers.get("x-claude-code-session-id"),
@@ -2044,7 +2054,7 @@ class Handler(BaseHTTPRequestHandler):
         usage = (_usage_from_stream(tee.text()) if streaming
                  else _usage_from_json(tee.text()))
         self._usage = usage
-        model = request.get("model") or ""
+        model = self._model = request.get("model") or ""
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in SECRET_HEADERS}
 
@@ -2220,7 +2230,7 @@ def _prune_lines() -> list[str]:
         return []
     t, why = prune.tier()
     from . import localai
-    out = [f"Local AI: {localai.describe()}",
+    out = [f"Local AI: {localai.describe()}", f"Cache keep-alive: {keepalive.describe()}",
            f"Smart prune: tier {t} ({why}); delete at p >= {config.get('prune_min_p')}; "
            f"ease off when strained: {'on' if config.get('bg_yield') else 'OFF (never pauses)'}"]
     if rows:

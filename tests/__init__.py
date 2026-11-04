@@ -68,6 +68,8 @@ def _urlopen(url, *a, **k):
     target = url.full_url if hasattr(url, "full_url") else str(url)
     if any(p in target for p in _OLLAMA_PORTS):
         raise OSError(f"test tried to reach a real ollama ({target}): mock it")
+    if "anthropic.com" in target:
+        raise OSError(f"test tried to reach the real Anthropic API ({target}): use a stub upstream")
     return _real_urlopen(url, *a, **k)
 
 

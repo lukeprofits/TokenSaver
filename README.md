@@ -90,6 +90,7 @@ tokensaver doctor        # is it installed and working?
 tokensaver --benchmark   # what it would have saved on your past sessions (minutes)
 tokensaver --benchmark full  # the same with local AI and every request counted (hours)
 tokensaver local-ai      # local AI: downloading, on, or skipped and why (`off` to stop it)
+tokensaver keepalive     # keep the cache warm through daytime breaks: on/off, saved and spent
 tokensaver proxy --stats # what it has saved so far
 tokensaver update        # get the latest version
 tokensaver uninstall     # remove it completely
@@ -206,6 +207,32 @@ tokensaver local-ai        # what it's doing: downloading (12 of 31 GB), on, or 
 tokensaver local-ai off    # never use or download it (keeps any files; uninstall removes them)
 tokensaver local-ai on     # download even with 100 GB or less free (never on a computer too small)
 tokensaver local-ai auto   # the default: only when both checks pass
+```
+
+## Keeping the cache warm through breaks (being verified)
+
+Claude forgets its cached copy of your conversation an hour after it was last
+used. Come back from lunch and the next message pays to send the whole
+conversation again at the full price: 40 times what reading it from the cache
+costs. Anthropic lets a program read the cache to keep it alive (they call it
+pre-warming); nothing is generated and nothing is added to your conversation.
+
+So about 50 minutes into a break, TokenSaver can do that read for you, once an
+hour, for 2.5% of what losing the cache would cost. It only pays if you come
+back, so it learns when your day usually ends from your own history and stops
+before that: it never keeps a session warm overnight or over a weekend. It
+counts what it saved and spent, and turns itself off if it ever spends more
+than it saves.
+
+On this project's own history (29 days) that would have cut the bill by about
+5% (`python3 experiments/keepalive.py` replays yours). It's off by default
+until it has been verified on real breaks; `tokensaver keepalive on` turns it
+on now. On a Pro or Max plan, these reads count toward your plan's usage.
+
+```sh
+tokensaver keepalive        # on or off, when it stops today, what it saved and spent
+tokensaver keepalive on     # turn it on
+tokensaver keepalive off    # never
 ```
 
 ## The ⚡ in your status line

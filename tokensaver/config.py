@@ -48,6 +48,9 @@ SPECS: dict[str, Spec] = {s.name: s for s in (
     Spec("local_ai", None, str, "auto",
          doc="auto | on | off: local models for break-time trimming (auto: only if this machine passes the "
              "specs and disk checks; on: skip the disk check; off: never)"),
+    Spec("cache_keepalive", None, str, "auto",
+         doc="auto | on | off: keep a session's cache warm through daytime breaks with a cheap read "
+             "(auto: once there are a few days of your hours to learn from; stops before your usual day end)"),
     Spec("prune_tier", None, str, "auto", doc="auto | off | fast | deep: local-model pruning of compactions"),
     Spec("prune_min_p", None, float, 0.8, 0.7, 0.99, "delete a piece only at this judge probability"),
     Spec("prune_judge", None, str, "nimble", doc="decision model for the prune judge"),

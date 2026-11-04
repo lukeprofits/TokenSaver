@@ -28,6 +28,10 @@ Local AI (extra trimming during breaks, on computers that can run it):
   tokensaver local-ai      what it is doing (downloading, on, skipped and why)
   tokensaver local-ai off  never use or download it; `auto` (the default) or `on` to allow it
 
+Cache keep-alive (a cheap read keeps Claude's cache alive through a daytime break):
+  tokensaver keepalive     what it is doing and what it saved and spent
+  tokensaver keepalive off never; `auto` (the default: once it has learned your usual hours) or `on`
+
 Checking and numbers:
   tokensaver doctor        is it installed and working?
   tokensaver proxy --stats what it has saved so far
@@ -67,6 +71,11 @@ def _toggle(cmd: str) -> int:
         try:
             from . import localai
             print(f"local AI: {localai.describe()}")
+        except Exception:
+            pass
+        try:
+            from . import keepalive
+            print(f"cache keep-alive: {keepalive.describe()}")
         except Exception:
             pass
         return 0
@@ -186,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="is TokenSaver on, off or paused, and is the proxy answering")
     sub.add_parser("help", help="the everyday commands, in plain words")
     sub.add_parser("update", help="pull the latest TokenSaver and restart the proxy")
+    p_ka = sub.add_parser("keepalive", help="keep the cache warm through daytime breaks: show, or set auto | on | off")
+    p_ka.add_argument("mode", nargs="?", choices=("auto", "on", "off"))
     p_ai = sub.add_parser("local-ai", help="local models for break-time trimming: show, or set auto | on | off")
     p_ai.add_argument("mode", nargs="?", choices=("auto", "on", "off"))
     p_ai.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)      # the background download
@@ -233,6 +244,18 @@ def main(argv: list[str] | None = None) -> int:
                       audit=args.audit, service=not args.no_service, with_hooks=args.with_hooks,
                       aliases=args.aliases, statusbar=args.statusbar,
                       local_ai=args.local_ai or ("on" if args.with_prune else None), refresh=args.refresh)
+    if args.cmd == "keepalive":
+        from . import keepalive
+        if args.mode:
+            from . import config as cf
+            cf.set_value("cache_keepalive", args.mode, "user", why="tokensaver keepalive")
+            if args.mode != "off":
+                st = keepalive.load_state()
+                st.pop("auto_off", None)          # an explicit choice clears an automatic stop
+                keepalive._save_state(st)
+        print(f"cache keep-alive: {keepalive.describe()}  (`tokensaver keepalive auto|on|off`; "
+              "takes effect within a minute, no restart)")
+        return 0
     if args.cmd == "local-ai":
         from . import localai
         if args.sync:
