@@ -602,12 +602,33 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     applied, epoch, decisions, applied_at = None, 0, 0, []
     failed = 0                     # counts Anthropic refused for this session
 
-    def removed(hist, ours) -> tuple[int, int] | None:
+    # A session that went through TokenSaver: its usage numbers are what TokenSaver sent, so
+    # plain Claude Code's size is rebuilt from the original messages (Claude Code's transcript
+    # keeps them as written): Anthropic's count of them plus the session's fixed part (system
+    # prompt and tools), measured where TokenSaver could not have trimmed anything but the
+    # small every-message passes: before the session's first break (no compaction yet), as
+    # its real size minus the count of the same messages rewritten that way.
+    through = bool(getattr(d, "through_ts", False))
+    plain_at: dict[int, int] = {}
+    floor_samples: list[int] = []
+    first_break = next((k for k in range(1, len(reqs))
+                        if sim._ts(reqs[k].timestamp) - sim._ts(reqs[k - 1].timestamp) > after_s), len(reqs))
+
+    def removed(hist, ours, k=None) -> tuple[int, int] | None:
         a, b = _pair(lambda m: count(model, m), hist, ours)
         if a is None or b is None:
             return None
         sig = bg._signature_chars(hist) - bg._signature_chars(ours)
+        if through and k is not None:
+            plain_at[k] = a + round(factor * bg._signature_chars(hist))
+            if k < first_break:
+                floor_samples.append(reqs[k].context - (b + round(factor * bg._signature_chars(ours))))
         return (a - b) + round(factor * sig), sig
+
+    def floor_now() -> int | None:
+        if not floor_samples:
+            return None
+        return max(sorted(floor_samples)[len(floor_samples) // 2], 0)
 
     last_epoch_start = 0
     for k, entry in enumerate(entries):
@@ -639,7 +660,9 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                     if n_now and n_new:
                         n_now += round(factor * bg._signature_chars(now))
                         n_new += round(factor * bg._signature_chars(new))
-                        floor = max(r.context - n_now, 0)       # system + tools: not in the count
+                        # system + tools: not in the count (for a TokenSaver session, the floor
+                        # measured before its first break: its usage is already trimmed)
+                        floor = (floor_now() or 0) if through else max(r.context - n_now, 0)
                         s_now, s_new = n_now + floor, n_new + floor
                         p = prices[k]
                         reps = (s_new * p.write_1h - s_now * p.read) / max((s_now - s_new) * p.read, 1)
@@ -675,7 +698,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                 ours = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off")
         epochs.append(epoch)
         if ours is not None:
-            g = removed(hist, ours)
+            g = removed(hist, ours, k)
             if g is not None:
                 removed_at[k], sig_at[k] = g
             else:
@@ -718,7 +741,14 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         # a bump reads the context its session had then
         return cost + sum(n * sizes[i] * prices[i].read / 1e6 for i, n in bumps)
 
-    plain = [r.context for r in reqs]
+    if through:
+        if not plain_at or floor_now() is None:
+            return {"skipped": "went through TokenSaver and could not be rebuilt (no counts)",
+                    "through_tokensaver": True}
+        fl = floor_now()
+        plain = [max(v + fl, 1) for v in fill(plain_at)]
+    else:
+        plain = [r.context for r in reqs]
     ours = [max(s - x, 1) for s, x in zip(plain, rem)]
     # The same result with the thinking factor 30% lower / higher (compaction
     # decisions held fixed): how much the headline leans on that one number.
@@ -741,7 +771,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             "ours_cost_factor_hi": round(price(ours_hi, rebuilt, kept_warm, bump_events), 4),
             "keepalive_bumps": sum(n for _, n in bump_events), "keepalive_kept": len(kept_warm),
             "keepalive_cost": round(bump_cost, 4), "keepalive_saved": round(kept_saved, 4),
-            "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4)}
+            "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4),
+            "through_tokensaver": through, **({"floor_tokens": floor_now()} if through else {})}
 
 
 # ---- the whole machine ------------------------------------------------------------
@@ -800,6 +831,27 @@ def reliability(rows: list[dict], count) -> list[str]:
             "    please send the saved result file: it lists the shape of each refused request (block",
             "    types only, no text from your sessions), which is what is needed to fix it."]
     return out
+
+
+def measured_line(rows: list[dict]) -> str:
+    """For sessions that really went through TokenSaver: what you actually paid, against the
+    rebuilt plain cost and against the replay of today's TokenSaver on the same sessions."""
+    ts = [r for r in rows if r.get("through_tokensaver")]
+    if not ts:
+        return " sessions already through TokenSaver: none"
+    plain = sum(r["plain_cost"] for r in ts)
+    real = sum(r["real_cost"] for r in ts)
+    ours = sum(r["ours_cost"] for r in ts)
+    # The real bill is billed, the plain one modelled: scale the model by how far it is from the
+    # real bill on the sessions that never went through TokenSaver (where both are plain).
+    others = [r for r in rows if not r.get("through_tokensaver")]
+    mp, mr = sum(r["plain_cost"] for r in others), sum(r["real_cost"] for r in others)
+    cal = mr / mp if mp > 0 and others else 1.0
+    return (f" {len(ts)} sessions already went through TokenSaver: you paid ${real:,.2f}, plain Claude Code "
+            f"would have been ~${plain * cal:,.2f} (rebuilt from the original messages"
+            + (f", the cost model scaled by {cal:.3f} to match your real bill" if others else "")
+            + f"): {_pct(real, plain * cal):.1f}% cheaper as it ran. Today's TokenSaver on them, replayed: "
+            f"{_pct(ours, plain):.1f}% cheaper")
 
 
 def keepalive_line(rows: list[dict], ends) -> str:
@@ -893,7 +945,9 @@ def _hours(seconds: float) -> str:
 
 def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | None = None,
         mode: str = "fast") -> int:
-    data = [d for d in sim.sessions() if not since or d.session.ended[:10] >= since]
+    # Sessions that already went through TokenSaver are included: their plain sizes are rebuilt
+    # from the original messages (see replay), so before, after, or only-with TokenSaver all count.
+    data = [d for d in sim.sessions(include_rewritten=True) if not since or d.session.ended[:10] >= since]
     data = [d for d in data if all(r.model.startswith("claude") for r in d.requests)]
     n_req = sum(len(d.requests) for d in data)
     after_s, payback = config.SPECS["bg_after_min"].default * 60, config.SPECS["bg_warm_payback_max"].default
@@ -911,6 +965,10 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
     print(f"TokenSaver benchmark {__version__} ({mode}): {len(data)} Claude Code sessions, "
           f"{n_req:,} requests on this machine.")
     print("It replays each one through today's TokenSaver and compares with what you actually sent.")
+    n_ts = sum(1 for d in data if getattr(d, "through_ts", False))
+    if n_ts:
+        print(f"{n_ts} of them already went through TokenSaver: their plain Claude Code size is rebuilt from "
+              "the original messages, and what you paid is shown as a measured saving.")
     print(f"About {calls:,} token counts (Anthropic's count_tokens endpoint: free, no messages are created),")
     print(f"roughly {max(1, calls // 250)}-{max(2, calls // 120)} minutes. They send your sessions' messages to Anthropic,")
     print("which processed them originally. The result file holds numbers only.")
@@ -988,12 +1046,14 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               f"{_pct(r['ours_tokens'], r['plain_tokens']):5.1f}% tokens  {_pct(r['ours_cost'], r['plain_cost']):5.1f}% cost  "
               f"compactions {r['compactions']}  ({time.time() - t:.0f}s)", flush=True)
     ok = [r for r in rows if "skipped" not in r]
-    pc, rc = sum(r["plain_cost"] for r in ok), sum(r["real_cost"] for r in ok)
+    plainside = [r for r in ok if not r.get("through_tokensaver")]
+    pc, rc = sum(r["plain_cost"] for r in plainside), sum(r["real_cost"] for r in plainside)
     lines = ["", "What TokenSaver would have saved on this machine (defaults, vs plain Claude Code, "
                  + ("with local AI, every request counted):" if mode == "full" else
                     "without local AI: `--benchmark full` includes it):")]
     lines += summarize(rows)
-    lines += [f" cost model check: plain modelled ${pc:,.2f} vs your real bill ${rc:,.2f}",
+    lines += [f" cost model check (sessions without TokenSaver): plain modelled ${pc:,.2f} vs your real bill ${rc:,.2f}",
+              measured_line(ok),
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
                  if count.errors else "")

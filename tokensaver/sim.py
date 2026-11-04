@@ -69,6 +69,7 @@ class SessionData:
     requests: list
     price: object
     _blocks: list | None = field(default=None, repr=False)
+    through_ts: bool = False       # the proxy rewrote it: its usage numbers are already trimmed
 
     @property
     def blocks(self):
@@ -97,16 +98,20 @@ def rewritten() -> set[str]:
         return set()
 
 
-def sessions(root: Path = DEFAULT_ROOT) -> list[SessionData]:
-    fk = forks(root) | rewritten()
+def sessions(root: Path = DEFAULT_ROOT, include_rewritten: bool = False) -> list[SessionData]:
+    """Sessions with priced requests, forks left out. Sessions the proxy rewrote are left
+    out too (their usage is already trimmed), unless `include_rewritten`: then they are
+    kept and marked `through_ts`, and the caller must rebuild their plain sizes."""
+    fk = forks(root)
+    rw = rewritten()
     out = []
     for s in load(root):
-        if not s.requests or s.path.stem in fk:
+        if not s.requests or s.path.stem in fk or (s.path.stem in rw and not include_rewritten):
             continue
         price = resolve(s.primary_model).price
         rq = [r for r in s.requests if r.timestamp]
         if price and rq:
-            out.append(SessionData(s, rq, price))
+            out.append(SessionData(s, rq, price, through_ts=s.path.stem in rw))
     return out
 
 

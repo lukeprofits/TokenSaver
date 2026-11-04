@@ -299,5 +299,74 @@ class KeepAliveReplayTest(unittest.TestCase):
         self.assertEqual(on["plain_cost"], off["plain_cost"], "plain Claude Code has no keep-alive")
 
 
+class ThroughTokenSaverTest(unittest.TestCase):
+    """A session that already went through TokenSaver has trimmed usage numbers; its plain
+    size is rebuilt from the original messages plus the fixed part measured before its first
+    break."""
+
+    def test_plain_rebuilt_from_originals(self):
+        import time as _t
+        from types import SimpleNamespace
+        from tokensaver import pricing
+        d = Path(tempfile.mkdtemp())
+        FIXED = 30_000
+        count = lambda model, msgs, **k: 1000 + len(json.dumps(msgs)) // 4
+        rows, t, msgs = [], _t.mktime((2026, 10, 20, 9, 0, 0, 0, 0, -1)), []
+        for i in range(20):
+            t += 60
+            stamp = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(t))
+            user = {"role": "user", "content": [{"type": "text", "text": f"step {i} " + "x" * 400}]}
+            msgs.append(user)
+            sent = count("m", msgs) + FIXED // 2           # as billed through TokenSaver: half the fixed part
+            rows.append({"type": "user", "timestamp": stamp, "message": {"role": "user", "content": user["content"]}})
+            reply = [{"type": "text", "text": f"done {i}"}]
+            rows.append({"type": "assistant", "timestamp": stamp, "message": {
+                "id": f"m{i}", "role": "assistant", "model": "claude-opus-5-5", "content": reply,
+                "usage": {"input_tokens": 2, "cache_read_input_tokens": sent, "output_tokens": 5}}})
+            msgs.append({"role": "assistant", "content": reply})
+        path = d / "s.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows))
+        sess = SimpleNamespace(path=path, primary_model="claude-opus-5-5")
+        price = pricing.price_for("claude-opus-5-5")
+        plain = benchmark.replay(SimpleNamespace(session=sess, price=price, stem="s"), count, 1, 900, 70, 0.264)
+        ts = benchmark.replay(SimpleNamespace(session=sess, price=price, stem="s", through_ts=True),
+                              count, 1, 900, 70, 0.264)
+        self.assertTrue(ts["through_tokensaver"])
+        self.assertAlmostEqual(ts["floor_tokens"], FIXED // 2 + 2, delta=5, msg="the fixed part, measured")
+        self.assertAlmostEqual(ts["plain_tokens"], plain["plain_tokens"], delta=200,
+                               msg="rebuilt sizes match the billed ones when nothing was trimmed")
+        line = benchmark.measured_line([ts])
+        self.assertIn("already went through TokenSaver", line)
+
+    def test_trimmed_usage_does_not_lower_the_plain_baseline(self):
+        import time as _t
+        from types import SimpleNamespace
+        from tokensaver import pricing
+        d = Path(tempfile.mkdtemp())
+        count = lambda model, msgs, **k: 1000 + len(json.dumps(msgs)) // 4
+        rows, t, msgs, billed = [], _t.mktime((2026, 10, 20, 9, 0, 0, 0, 0, -1)), [], 0
+        for i in range(20):
+            t += 2 * 3600 if i == 10 else 60                      # a break, then TokenSaver trimmed
+            stamp = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(t))
+            user = {"role": "user", "content": [{"type": "text", "text": f"step {i} " + "x" * 400}]}
+            msgs.append(user)
+            full = count("m", msgs) + 20_000
+            sent = full if i < 10 else full // 2                  # the trimmed requests billed half
+            billed += sent
+            rows.append({"type": "user", "timestamp": stamp, "message": {"role": "user", "content": user["content"]}})
+            reply = [{"type": "text", "text": f"done {i}"}]
+            rows.append({"type": "assistant", "timestamp": stamp, "message": {
+                "id": f"m{i}", "role": "assistant", "model": "claude-opus-5-5", "content": reply,
+                "usage": {"input_tokens": 2, "cache_read_input_tokens": sent, "output_tokens": 5}}})
+            msgs.append({"role": "assistant", "content": reply})
+        path = d / "s.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows))
+        sess = SimpleNamespace(path=path, primary_model="claude-opus-5-5")
+        ts = benchmark.replay(SimpleNamespace(session=sess, price=pricing.price_for("claude-opus-5-5"), stem="s",
+                                              through_ts=True), count, 1, 900, 70, 0.264)
+        self.assertGreater(ts["plain_tokens"], billed * 1.2, "plain is rebuilt, not the trimmed bill")
+        self.assertAlmostEqual(ts["floor_tokens"], 20_002, delta=5)
+
+
 if __name__ == "__main__":
     unittest.main()
