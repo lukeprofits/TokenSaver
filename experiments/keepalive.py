@@ -26,7 +26,8 @@ H = 3600
 
 def main() -> int:
     fk = sim.forks()
-    ss = [s for s in transcripts.load() if s.requests and s.path.stem not in fk]
+    ss = [s for s in transcripts.load() if s.requests and s.path.stem not in fk
+          and ka.interactive(f"(external, {ka._entrypoint(s.path) or 'cli'})")]
     times = [sim._ts(r.timestamp) for s in ss for r in s.requests]
     ends = ka.day_ends(times)
     now = max(times)

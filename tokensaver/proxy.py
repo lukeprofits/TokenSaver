@@ -614,6 +614,33 @@ def _warm_ok(pending: dict) -> tuple[bool, str]:
     return True, f"payback {n:.0f} <= {limit:.0f} requests"
 
 
+def keepalive_value(session: str, size: int, model: str) -> float:
+    """What keeping this session's cache warm through the break is worth, in dollars,
+    given the compaction prepared for it (keepalive asks before each bump):
+    - none prepared: the whole rewrite a cold return would pay, size x (write_1h - read);
+    - one the warm return would apply anyway (its payback passes): nothing, since the
+      return pays the write of the smaller history either way;
+    - one only a cold return would apply: the smaller history's rewrite, less the reads
+      it would have saved on the next `bg_warm_payback_max` requests."""
+    p = pricing.price_for(model or "")
+    if not p:
+        return 0.0
+    full = size * (p.write_1h - p.read) / 1e6
+    with _STATE_LOCK:
+        pending = _bg_load(session).get("pending") or {}
+    if not (pending.get("gate") or {}).get("passed"):
+        return full
+    if _warm_ok(pending)[0]:
+        return 0.0
+    new = int(pending.get("sent_new") or 0) or max(
+        0, size - (int(pending.get("old_tokens") or 0) - int(pending.get("new_tokens") or 0)))
+    n = config.get("bg_warm_payback_max")
+    return max(0.0, (new * p.write_1h - size * p.read - (size - new) * p.read * n) / 1e6)
+
+
+keepalive.VALUE = keepalive_value
+
+
 ESTIMATE_MARGIN = 0.2      # with no real count, compact only if the estimate saves 20% of the old part
 
 

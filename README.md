@@ -218,18 +218,30 @@ conversation again at the full price: 40 times what reading it from the cache
 costs. Anthropic lets a program read the cache to keep it alive (they call it
 pre-warming); nothing is generated and nothing is added to your conversation.
 
-So about 50 minutes into a break, TokenSaver can do that read for you, once an
-hour, for 2.5% of what losing the cache would cost. It only pays if you come
-back. Most breaks (meetings, lunch) end within 1–3 hours, so it does the read
-twice after a break, keeps going only while it's before your usual end of day
-(learned from your own history), and never through the night. Only bigger
-sessions, or ones you've come back to before, get it. It counts what it saved
-and spent, and turns itself off if it ever spends more than it saves.
+So 58 minutes into a break, just before the cache would go, TokenSaver can do
+that read for you, for 2.5% of what losing the cache would cost. It only pays if
+you come back. Most breaks (meetings, lunch) end within 1–3 hours, so it does
+the read twice after a break, keeps going only while it's before your usual end
+of day (learned from your own history), and never through the night. Only
+bigger sessions, or ones you've come back to before, get it.
 
-On this project's own history (29 days) that would have cut the bill by about
-7% (`python3 experiments/keepalive.py` replays yours). It's off by default
-until it has been verified on real breaks; `tokensaver keepalive on` turns it
-on now. On a Pro or Max plan, these reads count toward your plan's usage.
+It stays out of the way:
+- only while the session is open, only for Claude Code itself (not `claude -p`
+  or scripts), only with Anthropic's own API;
+- never when a break-time trim would run on your return anyway, and never when
+  you're close to a rate limit;
+- your login stays in memory only, for at most 12 hours, and is dropped if you
+  log in as someone else;
+- it checks every read; if one ever finds the cache already gone, it moves
+  earlier, and a second time it turns itself off;
+- it counts what it saved and spent, and turns itself off if fewer breaks come
+  back warm than it needs to break even.
+
+On this project's own history (28 days, interactive sessions only) it would
+have cut the bill by about 8% (`python3 experiments/keepalive.py` replays
+yours). It's off by default until it has been verified on real breaks;
+`tokensaver keepalive on` turns it on now. On a Pro or Max plan, these reads
+count toward your plan's usage.
 
 ```sh
 tokensaver keepalive        # on or off, when it stops today, what it saved and spent

@@ -328,17 +328,24 @@ class SettleTest(Base):
         mock.patch.object(ka, "VERIFIED", True).start()
         config.set_value("cache_keepalive", "auto", "user")
         st = {"breaks": [{"t": time.time(), "session": "x", "bumps": 1, "spent": 0.08, "saved": 0.0,
-                          "kept": False, "misses": 0, "size": 1} for _ in range(9)]}
+                          "stake": 2.3, "kept": False, "misses": 0, "size": 1} for _ in range(90)]}
         ka._save_state(st)
         ka._SESSIONS["s"] = session(time.time() - 3 * H, bumps=1, spent=0.08, last_bump=time.time() - H - 60)
         ka.tick(is_open=lambda s: True)
         self.assertNotIn("s", ka._SESSIONS)
         st = ka.load_state()
         self.assertFalse(st["breaks"][-1]["kept"])
-        self.assertIn("spent", st["auto_off"])
+        self.assertIn("break-even needs", st["auto_off"])
         self.assertFalse(ka.enabled(st)[0])
         config.set_value("cache_keepalive", "on", "user")
         self.assertTrue(ka.enabled(st)[0], "`on` overrides the automatic stop")
+
+    def test_bad_luck_is_not_a_reason_to_stop(self):
+        rows = lambda kept, n: [{"bumps": 2, "kept": i < kept, "stake": 3.0, "spent": 0.15,
+                                 "saved": 3.0 if i < kept else 0} for i in range(n)]
+        self.assertIsNone(ka.auto_off_reason(rows(0, 20)), "0 of 20 at a 5% break-even: 36% by chance")
+        self.assertIsNone(ka.auto_off_reason(rows(3, 60)), "5% kept: at break-even")
+        self.assertIn("0 of 60", ka.auto_off_reason(rows(0, 60)))
 
     def test_off_holds_nothing(self):
         self.on()

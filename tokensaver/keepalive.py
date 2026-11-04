@@ -12,8 +12,9 @@ and the cache lives another hour.
 It pays only if the user comes back before the cache would have died anyway.
 The rule (FREE_BUMPS, MAX_BUMPS): in a big or returned-to session, two bumps
 after any break, more only before this user's usual end of day (`stop_hour`,
-learned from their own history), never through the night. Replayed on 29 days
-and 115 breaks: +6.9% of the bill (experiments/keepalive.py).
+learned from their own history), never through the night. Replayed on 28 days of
+interactive sessions: +8.0% of the bill (experiments/keepalive.py). A learned per-user
+model lost to this rule out of sample (experiments/keepalive_oos.py), so it is not used.
 
 A kept-warm return is warm for the proxy too (`last_warm`), so break-time
 compaction still happens only at its own swap points, as on any warm request.
@@ -84,13 +85,14 @@ DAILY_CAP_SHARE = 0.02
 HIT_SHARE = 0.9              # a bump read at least this share of the cached size and wrote
 WRITE_SHARE = 0.1            # under this share: the cache was alive
 LEARN_EVERY_S = 6 * H
-AUTO_OFF_MIN = 10            # bumped breaks before the rolling net can turn it off
+AUTO_OFF_MIN = 10            # bumped breaks before the break-even test (auto_off_reason) may turn it off
 AUTO_OFF_DAYS = 14
 UPSTREAM_OK = ("https://api.anthropic.com",)
 STATE = vault.VAULT_DIR / "keepalive.json"
 # `auto` turns on only once a real bump has been seen to work (accepted with Claude Code's own
 # settings, read the cache, and the next request found it warm). Until then auto = off.
 VERIFIED = False
+VALUE = None                 # set by the proxy: (session, size, model) -> dollars a warm return is worth
 TICK_S = 5
 MAX_SESSIONS = 20            # held at once (each holds its last request, a few MB)
 SEND_WORKERS = 4
@@ -158,7 +160,9 @@ def learn() -> dict:
     times, spend = [], {}
     forks = sim.forks()
     for s in transcripts.load():
-        if s.path.stem in forks:
+        # `claude -p` runs and scripts keep their own hours: only interactive sessions say
+        # when this person stops working.
+        if s.path.stem in forks or not interactive(f"(external, {_entrypoint(s.path) or 'cli'})"):
             continue
         p = pricing.price_for(s.primary_model)
         for r in s.requests:
@@ -203,6 +207,21 @@ def _update_state(**kw) -> dict:
         st.update(kw)
         _save_state(st)
         return st
+
+
+def _entrypoint(path) -> str:
+    try:
+        with open(path, errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 40:
+                    break
+                if '"entrypoint"' in line:
+                    m = re.search(r'"entrypoint"\s*:\s*"([^"]+)"', line)
+                    if m:
+                        return m.group(1)
+    except OSError:
+        pass
+    return ""
 
 
 # ---- on or off ------------------------------------------------------------------
@@ -260,14 +279,40 @@ def results(st: dict | None = None, now: float | None = None) -> dict:
             "wasted": sum(r["spent"] for r in rows if not r["kept"]), "breaks": len(rows)}
 
 
+def _binom_cdf(k: int, n: int, p: float) -> float:
+    import math
+    return sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(0, k + 1))
+
+
+def auto_off_reason(rows: list[dict]) -> str | None:
+    """Off only when this user's results are clearly below break-even, not on bad luck.
+
+    Break-even: bumps pay when the share of bumped breaks that came back to a warm cache is
+    at least p* = (all spent) / (all value at stake). Off when, over AUTO_OFF_MIN or more
+    bumped breaks, so few were kept that this would happen under 5% of the time if the true
+    share were p* (one-sided binomial test)."""
+    rows = [r for r in rows if r.get("bumps")]
+    n = len(rows)
+    stake = sum(float(r.get("stake") or r.get("saved") or 0) or 0 for r in rows)
+    spent = sum(float(r["spent"]) for r in rows)
+    if n < AUTO_OFF_MIN or stake <= 0:
+        return None
+    p_star = min(1.0, spent / stake)
+    kept = sum(1 for r in rows if r["kept"])
+    if kept / n < p_star and _binom_cdf(kept, n, p_star) < 0.05:
+        return (f"{kept} of {n} bumped breaks came back to a warm cache; break-even needs "
+                f"{100 * p_star:.0f}% (spent ${spent:.2f})")
+    return None
+
+
 def _settle(st: dict, rec: dict) -> None:
     """Add one finished break and apply the auto-off rule."""
     st.setdefault("breaks", []).append(rec)
     st["breaks"] = [r for r in st["breaks"] if time.time() - r["t"] < 60 * 86400][-500:]
-    r = results(st)
-    if r["breaks"] >= AUTO_OFF_MIN and r["saved"] < r["spent"]:
-        st["auto_off"] = (f"spent ${r['spent']:.2f} to save ${r['saved']:.2f} over "
-                          f"{AUTO_OFF_DAYS} days ({r['bumps']} bumps)")
+    recent = [r for r in st["breaks"] if time.time() - r["t"] < AUTO_OFF_DAYS * 86400]
+    why = auto_off_reason(recent)
+    if why:
+        st["auto_off"] = why
 
 
 # ---- what the proxy tells this module -----------------------------------------------
@@ -380,9 +425,14 @@ def remember(session: str | None, path: str, sent: bytes | None, headers: dict, 
 
 def _record_break(session: str, prev: dict, t: float, kept: bool) -> None:
     p = pricing.price_for(prev["model"])
-    saved = prev["size"] * (p.write_1h - p.read) / 1e6 if kept and p else 0.0
+    full = prev["size"] * (p.write_1h - p.read) / 1e6 if p else 0.0
+    # The value the proxy gave at the last bump (a prepared trim makes it smaller), else the
+    # whole rewrite.
+    stake = prev.get("value") if prev.get("value") is not None else full
+    saved = stake if kept else 0.0
     rec = {"t": t, "session": session[:8], "bumps": prev["bumps"], "spent": round(prev["spent"], 4),
-           "saved": round(saved, 4), "kept": kept, "misses": prev["misses"], "size": prev["size"]}
+           "saved": round(saved, 4), "stake": round(stake, 4), "kept": kept, "misses": prev["misses"],
+           "size": prev["size"]}
     with _LOCK:
         st = load_state()
         _settle(st, rec)
@@ -585,6 +635,13 @@ def tick(now: float | None = None, send=bump, is_open=None, wait: bool = False) 
             continue
         if why_not is None and not is_open(session):
             why_not = "the session is closed"
+        if why_not is None and VALUE is not None:
+            try:
+                s["value"] = VALUE(session, s["size"], s["model"])
+            except Exception:
+                s["value"] = None
+            if s["value"] is not None and s["value"] < MIN_SAVING_USD:
+                why_not = "the break-time trim will run on the return anyway"
         if why_not:
             s["headers"], s["dropped"] = {}, s.get("dropped") or why_not
             continue

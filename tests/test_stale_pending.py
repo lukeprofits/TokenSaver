@@ -119,5 +119,50 @@ class KeptWarmReturnTest(unittest.TestCase):
         self.assertLess(info["gap_s"], 50 * 60, "the gap is measured from the bump")
 
 
+class BumpValueTest(unittest.TestCase):
+    """keepalive asks the proxy what a warm return is worth before each bump."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.dir = Path(tempfile.mkdtemp())
+        mock.patch.object(proxy, "_bg_path", lambda s: self.dir / f"{s}.bg.json").start()
+
+    def tearDown(self):
+        mock.patch.stopall()
+
+    def value(self, pending):
+        proxy._bg_save("v", {"pending": pending} if pending else {})
+        return proxy.keepalive_value("v", 400_000, "claude-opus-5-5")
+
+    def test_no_compaction_prepared_is_the_whole_rewrite(self):
+        self.assertAlmostEqual(self.value(None), 400_000 * (8 - 0.2) / 1e6, places=4)
+
+    def test_a_compaction_the_warm_return_applies_anyway_is_worth_nothing(self):
+        with mock.patch.object(proxy.config, "get", side_effect=lambda k: 70.0 if k == "bg_warm_payback_max"
+                               else proxy.config.SPECS[k].default):
+            self.assertEqual(self.value({"gate": {"passed": True}, "payback_requests": 20}), 0.0)
+
+    def test_a_cold_only_compaction_counts_its_smaller_rewrite_and_lost_reads(self):
+        got = self.value({"gate": {"passed": True}, "payback_requests": 500, "sent_new": 250_000})
+        n = proxy.config.get("bg_warm_payback_max")
+        self.assertAlmostEqual(got, max(0.0, (250_000 * 8 - 400_000 * 0.2 - 150_000 * 0.2 * n) / 1e6), places=4)
+
+    def test_keepalive_skips_a_worthless_bump(self):
+        from tokensaver import keepalive as ka
+        import time
+        ka._SESSIONS.clear()
+        ka._SESSIONS["v"] = {"path": "/v1/messages", "sent": b"{}", "headers": {"a": "b"}, "size": 400_000,
+                             "model": "claude-opus-5-5", "bumps": 0, "spent": 0.0, "last_bump": None,
+                             "misses": 0, "inflight": False, "started": time.time() - 58.2 * 60}
+        sent = []
+        with mock.patch.object(ka, "VALUE", lambda *a: 0.0), \
+                mock.patch.object(ka, "enabled", return_value=(True, "on")):
+            ka.tick(send=lambda k, v: sent.append(k) or {"status": 200}, is_open=lambda s: True, wait=True)
+        self.assertEqual(sent, [])
+        self.assertIn("trim will run", ka._SESSIONS["v"]["dropped"])
+        ka._SESSIONS.clear()
+
+
 if __name__ == "__main__":
     unittest.main()
