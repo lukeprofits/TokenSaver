@@ -63,9 +63,6 @@ def main() -> int:
     limit = int(sys.argv[1]) if len(sys.argv) > 1 else 8
     done = {json.loads(x)["session"] for x in OUT.read_text().splitlines()} if OUT.exists() else set()
     state = Path(tempfile.mkdtemp())
-    proxy._bg_path = lambda s: state / f"{s}.bg.json"
-    events: list = []
-    proxy.vault.record = lambda kind, **k: events.append(dict(k, kind=kind))
     for n, (session, before, cut) in enumerate(breaks()):
         if n >= limit:
             break
@@ -74,24 +71,15 @@ def main() -> int:
         pending = bg.prepare(before)
         if not pending:
             continue
-        pending.update(made=time.time(), total_tokens=bg.size_tokens(before))
-        proxy._bg_save(session, {"pending": pending})
-        live = {"messages": before, "last": time.time() - 3600, "skeleton": {}}
         steps, t0 = [], time.time()
-        events.clear()
-        for _ in range(40):
-            t = time.time()
-            heavy = proxy._prune_step(session, live)
-            ev = events[-1] if events else {}
-            steps.append({"seconds": round(time.time() - t), "summary": ev.get("summary", ""),
+        last = [time.time()]
+
+        def on_step(ev):
+            steps.append({"seconds": round(time.time() - last[0]), "summary": ev.get("summary", ""),
                           "stage": (ev.get("meta") or {}).get("stage")})
+            last[0] = time.time()
             print(f"  {session} {steps[-1]['seconds']:5d}s  {steps[-1]['summary']}", flush=True)
-            got = proxy._bg_load(session)["pending"]
-            if got.get("prune_done") or not heavy:
-                break
-            if "paused" in steps[-1]["summary"]:
-                time.sleep(30)
-        got = proxy._bg_load(session)["pending"]
+        got, events = proxy.prune_offline(session, before, pending, state, on_step=on_step)
         after = after_of(session, before)
         old, recent = before[:cut], before[cut:]
         old_ids = set().union(*(indep_ident(flat(m)) for m in old))

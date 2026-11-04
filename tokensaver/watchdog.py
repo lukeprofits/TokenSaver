@@ -90,6 +90,14 @@ def revive() -> str | None:
 def once(check=healthy) -> str:
     """One check. Returns what it did (for logs and tests)."""
     try:
+        # An unfinished local AI download (laptop asleep, offline, logged out)
+        # carries on by itself; this only reads a small state file otherwise.
+        from . import localai
+        if localai.kick():
+            vault.record("local_ai", tool="watchdog", index=False, summary="local AI download restarted")
+    except Exception:
+        pass
+    try:
         rs = routing.state()
         if not rs.get("managed"):
             return "not managing routing"

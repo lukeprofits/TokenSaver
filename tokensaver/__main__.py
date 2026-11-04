@@ -24,11 +24,18 @@ Everyday commands:
   tokensaver pause         turn it off for the rest of today; back on by itself at midnight
   tokensaver on            turn it back on (also ends a pause early)
 
+Local AI (extra trimming during breaks, on computers that can run it):
+  tokensaver local-ai      what it is doing (downloading, on, skipped and why)
+  tokensaver local-ai off  never use or download it; `auto` (the default) or `on` to allow it
+
 Checking and numbers:
   tokensaver doctor        is it installed and working?
   tokensaver proxy --stats what it has saved so far
-  tokensaver --benchmark   what it would have saved on your past Claude sessions
+  tokensaver --benchmark   what it would have saved on your past Claude sessions, in minutes
                            (asks first; uses Anthropic's free token counter)
+  tokensaver --benchmark full
+                           the same with local AI and every request counted: hours (it
+                           shows an estimate and asks first)
 
 Keeping it current, or removing it:
   tokensaver update        get the latest version
@@ -57,6 +64,11 @@ def _toggle(cmd: str) -> int:
         else:
             state = "off (not set up: `tokensaver setup`)"
         print(f"TokenSaver is {state}; proxy {'answering' if h else 'not answering'}")
+        try:
+            from . import localai
+            print(f"local AI: {localai.describe()}")
+        except Exception:
+            pass
         return 0
     if cmd == "pause":
         until = routing.next_midnight()
@@ -159,9 +171,11 @@ def main(argv: list[str] | None = None) -> int:
     p_setup.add_argument("--with-hooks", action="store_true", help="also install vault hooks")
     p_setup.add_argument("--statusbar", choices=("yes", "no"), default="yes",
                          help="show ⚡ and the % saved in Claude Code's status line (default yes)")
-    p_setup.add_argument("--with-prune", action="store_true",
-                         help="also set up local models (ollama) that prune each compaction a little further "
-                              "(~0.5-1%% more): Nimble ~9 GB, 24 GB+; on a 48 GB+ Mac also the 35B ~22 GB")
+    p_setup.add_argument("--local-ai", choices=("auto", "on", "off"),
+                         help="local models that trim a little more during breaks (~0.5-1%% more), downloaded "
+                              "in the background: auto (default) only if this machine has the memory and more "
+                              "than 100 GB free disk; on: skip the disk check; off: never")
+    p_setup.add_argument("--with-prune", action="store_true", help=argparse.SUPPRESS)   # old name for --local-ai on
     p_setup.add_argument("--aliases", choices=("try", "replace"), default="try",
                          help="try: add claude-ts beside your aliases (default); replace: reroute claude itself")
     sub.add_parser("restart", help="restart the background proxy once nothing is in flight")
@@ -172,6 +186,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="is TokenSaver on, off or paused, and is the proxy answering")
     sub.add_parser("help", help="the everyday commands, in plain words")
     sub.add_parser("update", help="pull the latest TokenSaver and restart the proxy")
+    p_ai = sub.add_parser("local-ai", help="local models for break-time trimming: show, or set auto | on | off")
+    p_ai.add_argument("mode", nargs="?", choices=("auto", "on", "off"))
+    p_ai.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)      # the background download
     p_mig = sub.add_parser("migrate", help="move this machine from the old name (everytoken) to TokenSaver, once")
     p_mig.add_argument("--dry-run", action="store_true")
     p_mig.add_argument("--yes", action="store_true")
@@ -182,7 +199,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p_bench = sub.add_parser("benchmark", help="what TokenSaver would have saved on this machine's own history "
                                                 "(reads transcripts, changes nothing; free token counts)")
-    p_bench.add_argument("--step", type=int, default=8, help="count every Nth request (default 8)")
+    p_bench.add_argument("mode", nargs="?", choices=("fast", "full"), default="fast",
+                         help="fast (default, minutes): no local AI, every 8th request counted; "
+                              "full (hours): with local AI, every request counted")
+    p_bench.add_argument("--step", type=int, default=8, help="count every Nth request (default 8; full uses 1)")
     p_bench.add_argument("--since", metavar="YYYY-MM-DD", help="only sessions ending on or after this date")
     p_bench.add_argument("--yes", action="store_true", help="start without asking")
     p_bench.add_argument("--out", type=Path, help="where to write the shareable result (numbers only)")
@@ -211,8 +231,18 @@ def main(argv: list[str] | None = None) -> int:
         from . import setup as st
         return st.run(dry_run=args.dry_run, yes=args.yes, route=args.route, shell_rc=args.shell_rc,
                       audit=args.audit, service=not args.no_service, with_hooks=args.with_hooks,
-                      aliases=args.aliases, statusbar=args.statusbar, with_prune=args.with_prune,
-                      refresh=args.refresh)
+                      aliases=args.aliases, statusbar=args.statusbar,
+                      local_ai=args.local_ai or ("on" if args.with_prune else None), refresh=args.refresh)
+    if args.cmd == "local-ai":
+        from . import localai
+        if args.sync:
+            return localai.sync()
+        if args.mode:
+            print(localai.set_mode(args.mode))
+            return 0
+        print(f"local AI: {localai.describe()}  (setting: {localai.config.get('local_ai')}; "
+              "`tokensaver local-ai auto|on|off`)")
+        return 0
     if args.cmd == "watchdog":
         from . import watchdog
         print(watchdog.once())
@@ -225,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         return update.run()
     if args.cmd == "benchmark":
         from . import benchmark
-        return benchmark.run(step=args.step, since=args.since, yes=args.yes, out=args.out)
+        return benchmark.run(step=args.step, since=args.since, yes=args.yes, out=args.out, mode=args.mode)
     if args.cmd == "tune":
         from . import tune as tn
         d = tn.run(apply=not args.dry_run, force=args.force)

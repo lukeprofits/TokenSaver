@@ -60,8 +60,8 @@ class FitsTest(unittest.TestCase):
 
 
 class TierTest(unittest.TestCase):
-    def tier(self, want, models, ram):
-        cfg = {"prune_tier": want, "prune_judge": "nimble"}
+    def tier(self, want, models, ram, local_ai="auto"):
+        cfg = {"prune_tier": want, "prune_judge": "nimble", "local_ai": local_ai}
         with mock.patch.object(prune, "installed", return_value={m: 1 for m in models}), \
                 mock.patch("tokensaver.config.get", side_effect=lambda k: cfg[k]), \
                 mock.patch.object(machine, "ram_bytes", return_value=ram * 2 ** 30):
@@ -74,6 +74,9 @@ class TierTest(unittest.TestCase):
         self.assertEqual(self.tier("auto", ["nimble:latest"], 64), "fast")
         self.assertEqual(self.tier("auto", [], 64), "off")
         self.assertEqual(self.tier("off", ["nimble:latest", big], 64), "off")
+        self.assertEqual(self.tier("auto", ["nimble:latest", big], 64, local_ai="off"), "off",
+                         "`tokensaver local-ai off` turns the stages off even with the models installed")
+        self.assertEqual(self.tier("auto", ["nimble:9b-q8_0"], 64), "fast", "any Nimble tag is the judge")
 
 
 class StageTest(unittest.TestCase):

@@ -171,9 +171,9 @@ _NIMBLE_Q = {"superseded": {
         "no": "EARLIER holds something that still matters and is not in LATER, or it is unclear."}}}
 
 
-def _nimble(state: str, timeout: int = 300) -> float:
+def _nimble(state: str, timeout: int = 300, model: str = "nimble") -> float:
     url = bg.OLLAMA_URL.split("/api/")[0] + "/v1/systemone"
-    body = json.dumps({"model": "nimble", "state": state, "questions": _NIMBLE_Q}).encode()
+    body = json.dumps({"model": model, "state": state, "questions": _NIMBLE_Q}).encode()
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         ans = json.loads(resp.read())["answers"]["superseded"]
@@ -184,7 +184,7 @@ def judge(a: Piece, b: Piece, model: str) -> tuple[bool, list[str]]:
     """Deleted only if the model says YES with the pieces in both orders
     (generative models), or with p(yes) >= NIMBLE_MIN_P (nimble)."""
     if model.startswith("nimble"):
-        p = _nimble(f"EARLIER:\n{a.text[:PIECE_CHARS]}\n\nLATER:\n{b.text[:PIECE_CHARS]}")
+        p = _nimble(f"EARLIER:\n{a.text[:PIECE_CHARS]}\n\nLATER:\n{b.text[:PIECE_CHARS]}", model=model)
         return p >= NIMBLE_MIN_P, [f"p={p:.2f}"]
     ea, lb = a.text[:PIECE_CHARS], b.text[:PIECE_CHARS]
     votes = []
@@ -371,12 +371,15 @@ def remember_size(model: str) -> None:
 def tier() -> tuple[str, str]:
     """(off | fast | deep, why), from `prune_tier` and what this machine has."""
     from . import config, machine
+    if config.get("local_ai") == "off":
+        return "off", "local AI is off (`tokensaver local-ai auto` to allow it)"
     want = config.get("prune_tier")
     if want == "off":
         return "off", "prune_tier is off"
     inst = installed()
     judge_ok = bool(_name(config.get("prune_judge"), inst))
-    deep_ok = judge_ok and bool(_name(bg.LOCAL_MODEL, inst)) and machine.ram_bytes() >= 32 * 2 ** 30
+    # RAM on a Mac; the graphics card's own memory on Linux, where ollama runs the models
+    deep_ok = judge_ok and bool(_name(bg.LOCAL_MODEL, inst)) and machine.model_memory_bytes() >= 32 * 2 ** 30
     if want == "deep":
         return ("deep", "set") if deep_ok else (("fast", "deep needs the local model and 32 GB+")
                                                 if judge_ok else ("off", "the judge model is not installed"))
@@ -433,7 +436,7 @@ def _p(a: Piece, b: Piece, judge_model: str, cache: Cache) -> float:
     if got is not None:
         return float(got)
     if judge_model.startswith("nimble"):
-        p = _nimble(f"EARLIER:\n{a.text[:PIECE_CHARS]}\n\nLATER:\n{b.text[:PIECE_CHARS]}")
+        p = _nimble(f"EARLIER:\n{a.text[:PIECE_CHARS]}\n\nLATER:\n{b.text[:PIECE_CHARS]}", model=judge_model)
     else:
         p = 1.0 if judge(a, b, judge_model)[0] else 0.0
     cache.put(a, b, judge_model, p)

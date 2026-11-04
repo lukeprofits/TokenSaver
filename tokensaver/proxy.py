@@ -522,6 +522,38 @@ def _save_candidate(session: str, pending: dict, cand: dict, *, done: bool, gate
         _bg_save(session, st)
 
 
+def prune_offline(session: str, messages: list, pending: dict, state_dir: Path,
+                  on_step=None, max_steps: int = 40, sleep=time.sleep) -> tuple[dict, list]:
+    """The prune stages, run to the end with this proxy's own code on a compaction
+    outside live traffic (`--benchmark full`, experiments/final_check.py). State goes
+    to `state_dir`, vault records are collected instead of written. Returns the
+    resulting pending compaction (promoted, or the rules-only one) and the records."""
+    global _bg_path
+    events: list = []
+    saved_path, saved_record = _bg_path, vault.record
+    _bg_path = lambda s: Path(state_dir) / f"{s}.bg.json"
+    vault.record = lambda kind, **k: events.append(dict(k, kind=kind))
+    try:
+        pending = dict(pending, gate=pending.get("gate") or {"passed": True, "check": "none (rules only)"},
+                       made=pending.get("made") or time.time())
+        pending.setdefault("total_tokens", background.size_tokens(messages))
+        _bg_save(session, {"pending": pending})
+        live = {"messages": messages, "last": time.time() - 3600, "skeleton": {}}
+        for _ in range(max_steps):
+            heavy = _prune_step(session, live)
+            ev = events[-1] if events else {}
+            if on_step:
+                on_step(ev)
+            got = _bg_load(session).get("pending") or {}
+            if got.get("prune_done") or not heavy:
+                break
+            if "paused" in str(ev.get("summary", "")):
+                sleep(30)
+        return _bg_load(session).get("pending") or pending, events
+    finally:
+        _bg_path, vault.record = saved_path, saved_record
+
+
 def _prepare_due(st: dict, messages: list) -> bool:
     """Enough new history since the last compaction prepared OR applied.
     Measured: after an apply `pending` was empty, so the old check passed at
@@ -2187,7 +2219,9 @@ def _prune_lines() -> list[str]:
     except Exception:
         return []
     t, why = prune.tier()
-    out = [f"Smart prune: tier {t} ({why}); delete at p >= {config.get('prune_min_p')}; "
+    from . import localai
+    out = [f"Local AI: {localai.describe()}",
+           f"Smart prune: tier {t} ({why}); delete at p >= {config.get('prune_min_p')}; "
            f"ease off when strained: {'on' if config.get('bg_yield') else 'OFF (never pauses)'}"]
     if rows:
         # From 2026-10-23 a "final" row per compaction says whether the pruned

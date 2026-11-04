@@ -36,8 +36,10 @@ written at 1h; output tokens are the real ones; each request at its own
 model's price. The plain side is printed next to the real bill as a check.
 
 Not modelled (each would move the result a little): re-reads of cut content
-(0 measured in a real trial) and the optional local-model prune stages
-(about 0.5-1% more). The compaction itself is rules only, as replayed here.
+(0 measured in a real trial). Fast mode (the default) also leaves out local AI
+(about 0.5-1% more where a machine runs it); `full` runs it on each compaction
+the replay applies, through the proxy's own code (`proxy.prune_offline`), and
+counts every request: hours instead of minutes.
 
 The count calls send the transcripts' messages to Anthropic (who processed
 them originally), with the user's own Claude Code login or ANTHROPIC_API_KEY.
@@ -315,10 +317,12 @@ def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict
 # ---- one session ----------------------------------------------------------------
 
 def replay(d, count: Counter, step: int, after_s: float, payback: float, factor: float,
-           transform=None) -> dict:
+           transform=None, prune=None) -> dict:
     """One session. `transform(k, hist) -> messages` replaces tokensaver's
     rewrite with another tool's (experiments use it for Headroom); then no
-    compaction is emulated."""
+    compaction is emulated. `prune(cand, hist) -> cand` (`--benchmark full`)
+    runs the local AI stages on each compaction the replay applies; the
+    decision to apply is made on the rules-only compaction, as the proxy does."""
     messages, entries = transcripts.api_history(d.session.path)
     if not entries:
         return {"skipped": "no billed requests"}
@@ -372,6 +376,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                         p = prices[k]
                         reps = (s_new * p.write_1h - s_now * p.read) / max((s_now - s_new) * p.read, 1)
                         if s_new < s_now and (gap > 3600 or reps <= payback):
+                            if prune is not None:
+                                cand = prune(cand, hist)
                             applied, epoch = cand, epoch + 1
                             applied_at.append(k)
             ours = None
@@ -524,16 +530,62 @@ def factor_sensitivity(rows: list) -> list[str]:
             f"\"cheaper\" would move by at most {spread:.1f} points"]
 
 
-def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | None = None) -> int:
+# Measured on an M3 Max (64 GB), experiments/final_check.py, 8 real breaks, 2026-10-23: the
+# local AI stages took 291-1214 s per break (median ~650 s) with the 35B; Nimble alone is
+# quicker (fast tier, no deep stages or check), here estimated at a third of that.
+SECONDS_PER_BREAK = {"deep": 650, "fast": 220}
+FULL_MIN_CONTEXT = 60_000      # a break below this rarely has old history worth compacting
+
+
+def full_estimate(data, after_s: float, tier: str) -> tuple[int, float]:
+    """(breaks that may get a compaction, seconds of local AI) for `--benchmark full`:
+    an upper bound, since only breaks whose compaction pays are pruned."""
+    n = 0
+    for d in data:
+        reqs = d.requests
+        for k in range(1, len(reqs)):
+            if sim._ts(reqs[k].timestamp) - sim._ts(reqs[k - 1].timestamp) > after_s \
+                    and reqs[k].context >= FULL_MIN_CONTEXT:
+                n += 1
+    return n, n * SECONDS_PER_BREAK.get(tier, SECONDS_PER_BREAK["deep"])
+
+
+def _hours(seconds: float) -> str:
+    h = seconds / 3600
+    return f"about {h:.0f} hours" if h >= 1.5 else f"about {max(1, round(seconds / 60))} minutes"
+
+
+def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | None = None,
+        mode: str = "fast") -> int:
     data = [d for d in sim.sessions() if not since or d.session.ended[:10] >= since]
     data = [d for d in data if all(r.model.startswith("claude") for r in d.requests)]
     n_req = sum(len(d.requests) for d in data)
+    after_s, payback = config.SPECS["bg_after_min"].default * 60, config.SPECS["bg_warm_payback_max"].default
+    tier = None
+    if mode == "full":
+        from . import localai, prune as pr
+        tier, why = pr.tier()
+        if tier == "off":
+            print(f"`--benchmark full` runs the local AI models, and this machine has none ({why}; "
+                  f"local AI: {localai.describe()}).")
+            print("Run `tokensaver --benchmark` (fast) instead: it covers everything except local AI.")
+            return 2
+        step = 1
     calls = n_req * 2 // step + 50
-    print(f"TokenSaver benchmark {__version__}: {len(data)} Claude Code sessions, {n_req:,} requests on this machine.")
+    print(f"TokenSaver benchmark {__version__} ({mode}): {len(data)} Claude Code sessions, "
+          f"{n_req:,} requests on this machine.")
     print("It replays each one through today's TokenSaver and compares with what you actually sent.")
     print(f"About {calls:,} token counts (Anthropic's count_tokens endpoint: free, no messages are created),")
     print(f"roughly {max(1, calls // 250)}-{max(2, calls // 120)} minutes. They send your sessions' messages to Anthropic,")
     print("which processed them originally. The result file holds numbers only.")
+    if mode == "full":
+        breaks, secs = full_estimate(data, after_s, tier)
+        print(f"Full mode also runs local AI ({tier} tier) on each break that gets a compaction: up to "
+              f"{breaks} breaks, {_hours(secs + calls / 180 * 60)} in all on this machine. It can run "
+              "overnight; the models pause while you use the computer hard.")
+    else:
+        print("Fast mode leaves out local AI (about 0.5-1% more where a machine runs it): "
+              "`tokensaver --benchmark full` includes it and takes hours.")
     cred = credentials()
     if cred is None:
         print("\nNo credentials: log in to Claude Code, or set ANTHROPIC_API_KEY.")
@@ -547,7 +599,20 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         if input("\nStart? [y/N] ").strip().lower() not in ("y", "yes"):
             return 1
     count = Counter(auth)
-    after_s, payback = config.SPECS["bg_after_min"].default * 60, config.SPECS["bg_warm_payback_max"].default
+    pruner = None
+    if mode == "full":
+        import tempfile
+        from . import proxy
+        state = Path(tempfile.mkdtemp(prefix="tokensaver-bench-"))
+        seq = [0]
+
+        def pruner(cand, hist):
+            seq[0] += 1
+            t = time.time()
+            got, _ = proxy.prune_offline(f"bench-{seq[0]}", hist, dict(cand), state)
+            print(f"      local AI on a break: {cand['new_tokens']:,} -> {got.get('new_tokens', cand['new_tokens']):,} "
+                  f"tokens ({time.time() - t:.0f}s)", flush=True)
+            return dict(cand, **{k: got[k] for k in ("text", "new_tokens", "drop_refs", "stage") if k in got})
     print("\nmeasuring thinking tokens per model...", flush=True)
     factors = thinking_factors(data, count)
     for m, fa in factors.items():
@@ -563,7 +628,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         bg.MODEL.set(d.session.primary_model)
         t = time.time()
         try:
-            r = replay(d, count, step, after_s, payback, f)
+            r = replay(d, count, step, after_s, payback, f, prune=pruner)
         except Exception as exc:
             r = {"skipped": f"{type(exc).__name__}"}
         r["session"] = hashlib.sha256(d.stem.encode()).hexdigest()[:8]     # not the real id
@@ -577,7 +642,9 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               f"compactions {r['compactions']}  ({time.time() - t:.0f}s)", flush=True)
     ok = [r for r in rows if "skipped" not in r]
     pc, rc = sum(r["plain_cost"] for r in ok), sum(r["real_cost"] for r in ok)
-    lines = ["", "What TokenSaver would have saved on this machine (defaults, vs plain Claude Code):"]
+    lines = ["", "What TokenSaver would have saved on this machine (defaults, vs plain Claude Code, "
+                 + ("with local AI, every request counted):" if mode == "full" else
+                    "without local AI: `--benchmark full` includes it):")]
     lines += summarize(rows)
     lines += [f" cost model check: plain modelled ${pc:,.2f} vs your real bill ${rc:,.2f}",
               f" token counts: {count.calls:,} calls, {count.failed} failed"
@@ -590,7 +657,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
     lines += factor_sensitivity(ok)
     lines += reliability(ok, count)
     print("\n".join(lines))
-    report = {"tokensaver": __version__, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": step,
+    report = {"tokensaver": __version__, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": step, "mode": mode,
               "settings": {"bg_after_min": after_s / 60, "bg_warm_payback_max": payback},
               "thinking_factors": factors,
               "counts": {"calls": count.calls, "failed": count.failed},

@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tokensaver import background, machine, routing, watchdog
+from tokensaver import machine, routing, watchdog
 
 REAL = REAL_HOME / ".claude" / "settings.json"
 _BEFORE = REAL.read_bytes() if REAL.exists() else None
@@ -110,11 +110,6 @@ class MachineTest(unittest.TestCase):
         (bat / "status").write_text("Charging\n")
         self.assertFalse(machine._linux_battery(str(d)))
 
-    def test_gate_tier_by_memory_and_platform(self):
-        gb = 2 ** 30
-        self.assertEqual(background.gate_model_for(64 * gb, "macos"), "qwen3.6:35b-mlx")
-        self.assertNotEqual(background.gate_model_for(64 * gb, "linux"), "qwen3.6:35b-mlx", "MLX is macOS only")
-        self.assertIsNone(background.gate_model_for(4 * gb, "macos"), "too small: compaction off")
 
 
 if __name__ == "__main__":

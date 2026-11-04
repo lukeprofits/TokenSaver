@@ -36,6 +36,9 @@ UNIT = UNITS / "tokensaver-proxy.service"
 WATCH_UNIT = UNITS / "tokensaver-watchdog.service"
 WATCH_TIMER = UNITS / "tokensaver-watchdog.timer"
 WATCH_EVERY_S = 15
+OLLAMA_LABEL = "com.tokensaver.ollama"
+OLLAMA_PLIST = AGENTS / f"{OLLAMA_LABEL}.plist"
+OLLAMA_UNIT = UNITS / "tokensaver-ollama.service"
 
 
 def platform() -> str:
@@ -59,8 +62,10 @@ def _domain() -> str:
 
 # ---- macOS ---------------------------------------------------------------------
 
-def _plist(label: str, args: list[str], keepalive: bool, interval: int | None = None) -> str:
-    log = vault.VAULT_DIR / ("proxy.log" if label == LABEL else "watchdog.log")
+def _plist(label: str, args: list[str], keepalive: bool, interval: int | None = None,
+           env: dict | None = None, log: Path | None = None) -> str:
+    log = log or vault.VAULT_DIR / ("proxy.log" if label == LABEL else "watchdog.log")
+    env_xml = "".join(f"\n        <key>{k}</key><string>{v}</string>" for k, v in (env or {}).items())
     arg_xml = "".join(f"\n        <string>{a}</string>" for a in args)
     extra = ("    <key>KeepAlive</key>\n    <dict><key>SuccessfulExit</key><false/></dict>\n"
              "    <key>ThrottleInterval</key><integer>5</integer>\n    <key>ExitTimeOut</key><integer>25</integer>\n"
@@ -80,7 +85,7 @@ def _plist(label: str, args: list[str], keepalive: bool, interval: int | None = 
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key><string>{Path.home()}</string>
-        <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
+        <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>{env_xml}
     </dict>
 </dict>
 </plist>
@@ -370,6 +375,70 @@ def install() -> list[str]:
     notes.append("runs without a login session too (lingering on)" if linger.returncode == 0 else
                  "starts at login (lingering needs an admin: `sudo loginctl enable-linger $USER`)")
     return notes
+
+
+# ---- TokenSaver's own ollama (local AI; only where `localai.decide` says so) -----------
+
+def _ollama_env() -> dict:
+    from . import localai
+    return {"OLLAMA_HOST": f"127.0.0.1:{localai.OWN_PORT}", "OLLAMA_MODELS": str(localai.MODELS)}
+
+
+def ollama_plist_text() -> str:
+    from . import localai
+    return _plist(OLLAMA_LABEL, [str(localai.BIN), "serve"], keepalive=True, env=_ollama_env(),
+                  log=vault.VAULT_DIR / "ollama.log")
+
+
+def ollama_unit_text() -> str:
+    from . import localai
+    env = "".join(f"Environment={k}={v}\n" for k, v in _ollama_env().items())
+    return f"""[Unit]
+Description=TokenSaver's own ollama (local AI for break-time trimming)
+
+[Service]
+ExecStart={localai.BIN} serve
+Restart=always
+RestartSec=5
+Nice=10
+Environment=HOME={Path.home()}
+{env}StandardOutput=append:{vault.VAULT_DIR / 'ollama.log'}
+StandardError=append:{vault.VAULT_DIR / 'ollama.log'}
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def install_ollama() -> None:
+    """Write and start our ollama service (it is not in the request path: no proxy restart)."""
+    if platform() == "macos":
+        text = ollama_plist_text()
+        if not (OLLAMA_PLIST.exists() and OLLAMA_PLIST.read_text() == text and _loaded(OLLAMA_LABEL)):
+            _install_agent(OLLAMA_PLIST, text, OLLAMA_LABEL)
+        return
+    if platform() != "linux":
+        raise RuntimeError(f"no service support on {sys.platform}")
+    UNITS.mkdir(parents=True, exist_ok=True)
+    OLLAMA_UNIT.write_text(ollama_unit_text())
+    _systemctl("daemon-reload")
+    r = _systemctl("enable", "--now", OLLAMA_UNIT.name)
+    if r.returncode != 0:
+        raise RuntimeError(f"systemctl --user enable --now {OLLAMA_UNIT.name}: {r.stderr.strip()}")
+
+
+def remove_ollama() -> bool:
+    """Stop and remove our ollama service. Returns whether there was one."""
+    if platform() == "macos" and OLLAMA_PLIST.exists():
+        _run(["launchctl", "bootout", f"{_domain()}/{OLLAMA_LABEL}"])
+        OLLAMA_PLIST.unlink()
+        return True
+    if platform() == "linux" and OLLAMA_UNIT.exists():
+        _systemctl("disable", "--now", OLLAMA_UNIT.name)
+        OLLAMA_UNIT.unlink()
+        _systemctl("daemon-reload")
+        return True
+    return False
 
 
 # Names from before the rename (2026-10-23): removed by `migrate` and `uninstall`.

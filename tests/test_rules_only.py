@@ -1,5 +1,5 @@
 """Compaction without a model: prepare needs no ollama, the quality signals can
-turn it off, and setup gives every machine compaction (models only with --with-prune)."""
+turn it off, and setup gives every machine compaction (local AI only where it passes the checks)."""
 
 import tests  # noqa: F401  isolation first (tests/__init__.py): fake HOME, guarded commands
 from tests import REAL_HOME  # noqa: E402
@@ -112,36 +112,48 @@ class SetupTierTest(unittest.TestCase):
         config.PATH = self.saved_cfg
         config.load(force=True)
 
-    def plan(self, gb, platform, with_prune):
-        from tokensaver import machine, prune, service
-        with mock.patch.object(machine, "ram_bytes", return_value=gb * 2 ** 30), \
+    def plan(self, gb, platform, local_ai=None, disk_gb=500, own_tested=True):
+        from tokensaver import localai, machine, service
+        with mock.patch.object(machine, "model_memory_bytes", return_value=gb * 2 ** 30), \
+             mock.patch.object(machine, "ram_bytes", return_value=gb * 2 ** 30), \
+             mock.patch.object(machine, "disk_free_bytes", return_value=disk_gb * 2 ** 30), \
              mock.patch.object(service, "platform", return_value=platform), \
-             mock.patch.object(setup, "ollama_models", return_value=None), \
-             mock.patch.object(prune, "installed", return_value={}), \
+             mock.patch.object(localai, "_platform_name", return_value=platform), \
+             mock.patch.object(localai, "_arch", return_value="arm64"), \
+             mock.patch.object(localai, "_tags", return_value=None), \
+             mock.patch.object(localai, "_can_unzstd", return_value=True), \
+             mock.patch.dict(localai.OWN_OLLAMA_TESTED, {platform: own_tested}), \
              mock.patch.object(setup.shutil, "which", side_effect=lambda c: f"/usr/bin/{c}"), \
              mock.patch.object(setup, "billing_type", return_value="test"):
-            steps = setup.plan(route="settings", service=False, statusbar="no", with_prune=with_prune)
+            steps = setup.plan(route="settings", service=False, statusbar="no", local_ai=local_ai)
         return {s.name: s for s in steps}
 
     def test_every_machine_gets_compaction_without_models(self):
         for gb, plat in ((8, "macos"), (16, "linux"), (24, "macos"), (64, "macos"), (64, "linux")):
-            steps = self.plan(gb, plat, with_prune=False)
+            steps = self.plan(gb, plat)
             self.assertIn("bg_compact=True", steps["config"].detail)
             self.assertNotIn("local_model", steps["config"].detail)
-            self.assertNotIn("ollama", steps)
-            self.assertNotIn("prune", steps)
 
-    def test_with_prune_sizes_the_models(self):
-        small = self.plan(16, "macos", with_prune=True)
-        self.assertEqual(small["prune"].status, "skip", "Nimble needs 24 GB+")
-        mid = self.plan(32, "macos", with_prune=True)
-        self.assertEqual(mid["prune"].status, "todo")
-        self.assertNotIn("local_model", mid["config"].detail, "no 35B under 48 GB")
-        big = self.plan(64, "macos", with_prune=True)
-        self.assertIn("local_model=qwen3.6:35b-mlx", big["config"].detail)
-        self.assertIn("qwen3.6:35b-mlx", big["ollama"].detail)
-        linux = self.plan(64, "linux", with_prune=True)
-        self.assertNotIn("local_model", linux["config"].detail, "the 35B check is measured on macOS only")
+    def test_local_ai_sized_to_the_machine(self):
+        small = self.plan(16, "macos")
+        self.assertEqual(small["local-ai"].status, "skip", "Nimble needs 24 GB+")
+        self.assertIn("16 GB memory; needs 24 GB+", small["local-ai"].detail)
+        mid = self.plan(32, "macos")
+        self.assertEqual(mid["local-ai"].status, "todo")
+        self.assertIn("Nimble", mid["local-ai"].detail)
+        self.assertNotIn("35B", mid["local-ai"].detail, "no 35B under 48 GB")
+        big = self.plan(64, "macos")
+        self.assertIn("Nimble + 35B", big["local-ai"].detail)
+        self.assertIn("in the background", big["local-ai"].detail)
+        tight = self.plan(64, "macos", disk_gb=62)
+        self.assertEqual(tight["local-ai"].status, "skip")
+        self.assertIn("62 GB free disk; needs more than 100 GB", tight["local-ai"].detail)
+        forced = self.plan(64, "macos", local_ai="on", disk_gb=62)
+        self.assertEqual(forced["local-ai"].status, "todo", "`on` skips the disk check")
+        held = self.plan(64, "macos", own_tested=False)
+        self.assertEqual(held["local-ai"].status, "skip", "no download onto an untested ollama")
+        off = self.plan(64, "macos", local_ai="off")
+        self.assertIn("turned it off", off["local-ai"].detail)
 
 
 if __name__ == "__main__":

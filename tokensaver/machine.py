@@ -39,6 +39,7 @@ BATTERY_MIN = 30
 FREE_MIN_PCT = 10                 # below this free share of RAM: strained
 SWAP_GROWTH_MB = 512              # swap grown by more than this since the last check
 HEADROOM_BYTES = 6 * 2 ** 30      # free memory that must remain after loading a model
+GPU_HEADROOM_BYTES = 2 ** 30      # on a graphics card nothing else needs that memory
 PAUSE_S = (5, 30, 120)            # step 1 pause; how long strain lasts before step 2; then step 3
 
 _last = {"swap_mb": None, "t": 0.0}
@@ -183,16 +184,79 @@ def strained() -> tuple[bool, str]:
     return False, ""
 
 
+def _nvidia(field: str) -> list[int]:
+    """Per-GPU values in bytes from nvidia-smi (memory.total / memory.free, MiB); [] without it."""
+    out = _run(["nvidia-smi", f"--query-gpu={field}", "--format=csv,noheader,nounits"])
+    return [int(x) * 2 ** 20 for x in out.split() if x.strip().isdigit()]
+
+
+def _amd(name: str, root: str = "/sys/class/drm") -> list[int]:
+    vals = []
+    for p in sorted(glob.glob(f"{root}/card*/device/{name}")):
+        try:
+            vals.append(int(open(p).read().strip()))
+        except (OSError, ValueError):
+            pass
+    return vals
+
+
+def gpu() -> tuple[str | None, int]:
+    """Linux: (nvidia | amd | None, memory of the largest graphics card in bytes).
+    Local models need a card with its own memory there: on the CPU alone they
+    are too slow to be worth running. A card without its driver reads as none."""
+    if not LINUX:
+        return None, 0
+    nv = _nvidia("memory.total")
+    if nv:
+        return "nvidia", max(nv)
+    amd = _amd("mem_info_vram_total")
+    if amd and max(amd) > 2 ** 30:          # integrated graphics report a small carve-out
+        return "amd", max(amd)
+    return None, 0
+
+
+def gpu_free_bytes() -> int | None:
+    kind, _ = gpu()
+    if kind == "nvidia":
+        free = _nvidia("memory.free")
+        return max(free) if free else None
+    if kind == "amd":
+        total, used = _amd("mem_info_vram_total"), _amd("mem_info_vram_used")
+        return max(t - u for t, u in zip(total, used)) if total and len(total) == len(used) else None
+    return None
+
+
+def model_memory_bytes() -> int:
+    """The memory local models run in: RAM on a Mac (shared with the GPU), the
+    graphics card's own memory on Linux (0 without a usable card)."""
+    return gpu()[1] if LINUX else ram_bytes()
+
+
+def disk_free_bytes(path) -> int | None:
+    import os
+    import shutil
+    p = str(path)
+    while p and not os.path.exists(p):
+        p = os.path.dirname(p)
+    try:
+        return shutil.disk_usage(p or "/").free
+    except OSError:
+        return None
+
+
 def fits(model_bytes: int, loaded: bool = False) -> tuple[bool, str]:
-    """Whether loading a model of this size leaves HEADROOM_BYTES available. A
-    model already in memory always fits. Unknown memory: does not fit."""
+    """Whether loading a model of this size leaves HEADROOM_BYTES available
+    (on Linux: free graphics-card memory, where ollama loads it). A model
+    already in memory always fits. Unknown memory: does not fit."""
     if loaded:
         return True, "already loaded"
-    free = available_bytes()
+    on_gpu = LINUX and gpu()[0] is not None
+    free = gpu_free_bytes() if on_gpu else available_bytes()
+    headroom = GPU_HEADROOM_BYTES if on_gpu else HEADROOM_BYTES
     if not free or not model_bytes:
         return False, "available memory unknown"
-    if free - model_bytes < HEADROOM_BYTES:
-        return False, (f"needs {model_bytes / 2 ** 30:.0f} GB plus {HEADROOM_BYTES / 2 ** 30:.0f} GB headroom; "
+    if free - model_bytes < headroom:
+        return False, (f"needs {model_bytes / 2 ** 30:.0f} GB plus {headroom / 2 ** 30:.0f} GB headroom; "
                        f"{free / 2 ** 30:.0f} GB free")
     return True, "fits"
 

@@ -30,7 +30,7 @@ for _k in ("CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "TOKENSAVER_HOME", "EVERYTOKE
     os.environ.pop(_k, None)
 assert Path.home() == FAKE_HOME, "HOME override did not take"
 
-_REFUSE = {"claude", "launchctl", "systemctl", "loginctl", "ollama", "brew", "git", "plutil"}
+_REFUSE = {"claude", "launchctl", "systemctl", "loginctl", "ollama", "brew", "git", "plutil", "nvidia-smi"}
 
 
 def _argv0(args):
@@ -46,9 +46,29 @@ def _guard(real):
         name = _argv0(args)
         if name in _REFUSE:
             raise RuntimeError(f"test tried to run `{name}` on the real machine: mock it")
+        if isinstance(args, (list, tuple)) and "local-ai" in [str(x) for x in args]:
+            raise RuntimeError("test tried to start the local AI download: mock localai.start")
         return real(args, *a, **k)
     return wrapper
 
 
 subprocess.run = _guard(subprocess.run)
 subprocess.Popen = _guard(subprocess.Popen)
+
+# 3. No request reaches an ollama on this machine (the real one on :11434 would
+#    answer, and a pull would download gigabytes). Tests use their own stub server
+#    on another port, or mock localai._tags / pull.
+import urllib.request  # noqa: E402
+
+_OLLAMA_PORTS = (":11434", ":11435")
+_real_urlopen = urllib.request.urlopen
+
+
+def _urlopen(url, *a, **k):
+    target = url.full_url if hasattr(url, "full_url") else str(url)
+    if any(p in target for p in _OLLAMA_PORTS):
+        raise OSError(f"test tried to reach a real ollama ({target}): mock it")
+    return _real_urlopen(url, *a, **k)
+
+
+urllib.request.urlopen = _urlopen

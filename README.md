@@ -74,7 +74,9 @@ git clone https://github.com/lukeprofits/TokenSaver && TokenSaver/tokensaver-cli
 ```
 
 (It asks before starting: it uses Anthropic's free token counter with your
-own Claude login.)
+own Claude login. It takes minutes and leaves out local AI;
+`tokensaver --benchmark full` includes it and counts every request, which takes
+hours, so it shows an estimate first.)
 
 ## Commands
 
@@ -85,7 +87,9 @@ tokensaver off           # turn it off: new Claude sessions go straight to Anthr
 tokensaver pause         # off for the rest of today, back on by itself at midnight
 tokensaver on            # turn it back on (also ends a pause early)
 tokensaver doctor        # is it installed and working?
-tokensaver --benchmark   # what it would have saved on your past sessions
+tokensaver --benchmark   # what it would have saved on your past sessions (minutes)
+tokensaver --benchmark full  # the same with local AI and every request counted (hours)
+tokensaver local-ai      # local AI: downloading, on, or skipped and why (`off` to stop it)
 tokensaver proxy --stats # what it has saved so far
 tokensaver update        # get the latest version
 tokensaver uninstall     # remove it completely
@@ -153,8 +157,8 @@ loses nothing.
 |---|---|---|
 | **Trim old output.** In the older part of the conversation, old command output and file contents are cut to their first lines plus any line Claude referred to later, and a short list of the names that appeared there is added. Everything you and Claude wrote stays word for word, and the most recent part stays exactly as it was | nothing, any computer | every request after it is ~39% smaller; big sessions with several breaks ~30% cheaper |
 | **Short names for long paths.** Long folder paths that repeat a lot get a short name, only when that actually saves tokens | nothing | 0–2%, often skipped |
-| **Drop replaced pieces.** A small local AI model finds pieces that later work replaced (an old view of a file that was then edited, an attempt that was redone) | a local model, 24 GB+ memory | ~4% more |
-| **Drop repeated pieces.** A larger local model finds things that were said again later | a larger local model, 48 GB+ Mac | ~3% more |
+| **Drop replaced pieces.** A small local AI model finds pieces that later work replaced (an old view of a file that was then edited, an attempt that was redone) | local AI (see below) | ~4% more |
+| **Drop repeated pieces.** A larger local model finds things that were said again later | the larger local AI model | ~3% more |
 | **Pick the lines that matter.** The larger model picks which lines of old output to keep | same | ~1% more |
 | **Final check.** Before any AI-made trim is used, it quizzes both versions about the old conversation; if the trimmed one loses anything, the untrimmed one is used | same | none: it's the safety step |
 
@@ -163,27 +167,46 @@ still on disk and commands can be run again, so Claude re-reads what it needs.
 If Claude starts re-reading files or re-running commands more often after
 trimming, TokenSaver turns the break-time trimming off and tells you.
 
-## More savings on powerful computers
+## Local AI on powerful computers
 
 Everything above "Drop replaced pieces" works on any computer with no AI
-model. If your computer has the memory, you can add local AI models that run
-on your own machine for free (through [ollama](https://ollama.com)) and trim a
-little more during breaks:
+model. On a computer that can run them, TokenSaver also sets up local AI
+models (free, on your own machine, through [ollama](https://ollama.com)) that
+trim a little more during breaks. You don't have to do anything: it checks
+your computer and only sets them up if both checks pass.
 
 | your computer | what you get |
 |---|---|
 | any computer | everything on every message, plus the break-time trimming |
-| 24 GB+ of memory | + a small model (~9 GB download) that drops replaced pieces |
-| Mac with 48 GB+ | + a larger model (~22 GB) that drops repeated pieces, trims old output, and runs the final check |
+| Mac (Apple silicon) with 24 GB+ memory, or Linux with a 16 GB+ graphics card | + a small model (~9 GB) that drops replaced pieces |
+| Mac with 48 GB+, or Linux with a 32 GB+ graphics card | + a larger model (~22 GB) that drops repeated pieces, trims old output, and runs the final check |
+| less than that, or 100 GB or less of free disk | nothing extra: no models and no ollama are installed |
 
-That's about 0.5–1% more saving. It's opt-in, because the downloads are big:
+That's about 0.5–1% more saving.
+
+- **Install stays fast.** The models download in the background after the
+  installer finishes. TokenSaver works without them meanwhile and starts using
+  them by itself once they're in. If the download is interrupted (sleep,
+  offline), it picks up where it left off.
+- **Uses your ollama.** If ollama is running on your computer, TokenSaver
+  downloads the models into it. TokenSaver's own copy of ollama (in
+  `~/.tokensaver/ollama`, no sudo, removed by `tokensaver uninstall`) is still
+  being tested; until it ships, a computer without ollama gets no local AI, and
+  `tokensaver local-ai` says so. Install ollama from ollama.com, then run
+  `tokensaver update`.
+- **On Linux** the models run on your graphics card, so the card's driver
+  must be installed (on the processor alone they'd be too slow). Linux gets
+  the models once their Linux builds have passed the same quality checks as
+  the Mac ones; until then `tokensaver local-ai` says "not available on Linux
+  yet".
+- The models pause while you're working the computer hard or on battery.
 
 ```sh
-~/.tokensaver/src/install.sh --with-prune
+tokensaver local-ai        # what it's doing: downloading (12 of 31 GB), on, or skipped and why
+tokensaver local-ai off    # never use or download it (keeps any files; uninstall removes them)
+tokensaver local-ai on     # download even with 100 GB or less free (never on a computer too small)
+tokensaver local-ai auto   # the default: only when both checks pass
 ```
-
-It only installs what your computer can handle, and the models pause while
-you're working the machine hard.
 
 ## The ⚡ in your status line
 

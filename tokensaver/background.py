@@ -51,26 +51,12 @@ from . import compress, config
 OLLAMA_URL = config.get("ollama_url")
 LOCAL_MODEL = config.get("local_model")
 
-# The check model per machine (deep prune + the final check on a pruned
-# compaction), picked by setup (`gate_model_for`), largest first. A tier is
-# listed only if, on real breaks (experiments/gate_models.py), it failed every
-# deliberately broken compaction the 35B failed and agreed with the 35B on the
-# real ones. Below the smallest: no deep prune; compaction itself needs no model.
-GATE_MODELS: list[tuple[int, str | None, str]] = [   # (min RAM in GB, "macos" | "linux" | None, ollama tag)
-    (48, "macos", "qwen3.6:35b-mlx"),                 # the reference (MLX: Apple silicon)
-]
-# No smaller tier: experiments/gate_models.py, 2026-10-23, 8 real breaks. Each smaller model let
-# through a broken compaction the 35B blocked: qwen3:14b 1 of 16 (all of Claude's text removed),
-# qwen3:8b 4 of 16, gemma3:4b 1 of 4 (run stopped there); qwen3:4b gave no usable answers.
-# Machines without the 35B get no deep prune (rules-only compaction still runs).
-
-
-def gate_model_for(ram_bytes: int, platform: str) -> str | None:
-    gb = ram_bytes / 2 ** 30
-    for min_gb, plat, tag in GATE_MODELS:
-        if gb >= min_gb and plat in (None, platform):
-            return tag
-    return None
+# Which machine gets which model (Nimble, the 35B check model): `localai.TIERS`.
+# No check model smaller than the 35B: experiments/gate_models.py, 2026-10-23, 8 real
+# breaks. Each smaller model let through a broken compaction the 35B blocked: qwen3:14b
+# 1 of 16 (all of Claude's text removed), qwen3:8b 4 of 16, gemma3:4b 1 of 4 (run stopped
+# there); qwen3:4b gave no usable answers. Machines without the 35B get no deep prune
+# (rules-only compaction still runs).
 
 KEEP_TOKENS = config.get("bg_keep_tokens")      # recent history kept verbatim
 # What decides: how much old history a compaction would replace (the system,

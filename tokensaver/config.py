@@ -45,6 +45,9 @@ SPECS: dict[str, Spec] = {s.name: s for s in (
     Spec("binding_monitor", None, bool, True,
          doc="ask the API to report thinking blocks that fail the preserved-thinking check (header only)"),
     Spec("bg_yield", None, bool, True, doc="ease off background model work when the machine strains"),
+    Spec("local_ai", None, str, "auto",
+         doc="auto | on | off: local models for break-time trimming (auto: only if this machine passes the "
+             "specs and disk checks; on: skip the disk check; off: never)"),
     Spec("prune_tier", None, str, "auto", doc="auto | off | fast | deep: local-model pruning of compactions"),
     Spec("prune_min_p", None, float, 0.8, 0.7, 0.99, "delete a piece only at this judge probability"),
     Spec("prune_judge", None, str, "nimble", doc="decision model for the prune judge"),

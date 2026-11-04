@@ -5,10 +5,10 @@ token counts) as a background service; a watchdog that routes Claude Code
 around the proxy if it stays down; and routing, by default through the `env`
 block of ~/.claude/settings.json, so every Claude Code launch (terminal and
 IDE extensions) goes through it with no wrapper. Background compaction is
-rules only and needs no model, so every machine gets it. `--with-prune` adds
-local models (ollama): Nimble for the fast prune (24 GB+), and on a machine
-that fits it (`background.gate_model_for`) the 35B for the deep prune and the
-one check before a pruned compaction is used. `--route alias` keeps the
+rules only and needs no model, so every machine gets it. Local AI (`localai`):
+a machine that passes the specs and disk checks also gets local models that
+trim a little more during breaks, downloaded in the background after setup
+returns (`--local-ai auto|on|off`, default auto). `--route alias` keeps the
 older shell-alias route (`claude-ts`).
 
 Rules:
@@ -260,76 +260,53 @@ def _strip_block(text: str) -> str:
     return re.sub(r"\n?" + re.escape(RC_BEGIN) + r".*?" + re.escape(RC_END) + r"\n?", "", text, flags=re.S)
 
 
-# ---- ollama and the gate model -------------------------------------------------
+# ---- local AI -------------------------------------------------------------------
 
-def _ollama_base() -> str:
-    return config.get("ollama_url").split("/api/")[0]
-
-
-def ollama_models() -> list[str] | None:
-    """Installed ollama model names, or None when ollama is not answering."""
-    try:
-        with urllib.request.urlopen(_ollama_base() + "/api/tags", timeout=2) as resp:
-            return [m.get("name") for m in json.loads(resp.read()).get("models") or []]
-    except Exception:
-        return None
-
-
-def ollama_step(model: str | None) -> Step:
-    """Install ollama if needed (for `--with-prune`), and pull the 35B when
-    this machine can run it (deep prune and its check); Nimble is pulled by
-    `prune_step`."""
-    from . import machine, service
-    names = ollama_models()
-    have_bin = bool(shutil.which("ollama"))
-    fits = (f"the {model} for the deep prune and its check" if model else
-            f"no 35B (it needs a 48 GB+ Mac; this is {machine.ram_bytes() / 2 ** 30:.0f} GB, "
-            f"{service.platform()}): fast prune only")
-    if names is not None and (model is None or model in names):
-        return Step("ollama", "already", f"ollama running; {fits}")
-    actions, notes = [], []
-    if not have_bin:
-        if service.platform() == "macos" and shutil.which("brew"):
-            actions.append(["brew", "install", "ollama"])
-            notes.append("installs ollama with Homebrew and starts it as a login service")
-        elif service.platform() == "linux":
-            return Step("ollama", "skip", "ollama is not installed. Install it (needs sudo): "
-                        "`curl -fsSL https://ollama.com/install.sh | sh`, then run setup again; until then "
-                        "no pruning (compaction still runs)")
-        else:
-            return Step("ollama", "skip", "ollama is not installed: get it from https://ollama.com/download, "
-                        "then run setup again; until then no pruning (compaction still runs)")
+def local_ai_step(mode: str | None = None) -> Step:
+    """Local models for break-time trimming, only where this machine passes the
+    specs and disk checks (`localai.decide`). Applying it never waits: the
+    download runs in the background after setup returns."""
+    from . import localai
+    d = localai.decide(mode)
+    retag = localai.configure(d, dry=True)
+    if d["skip"]:
+        status = "todo" if mode else "skip"
+        what = f"local AI: skipped ({d['skip']}); everything else works without it"
+    elif not d["missing"]:
+        status = "todo" if mode or retag else "already"
+        what = f"local AI: {localai.describe(d)}"
+    else:
+        status = "todo"
+        what = (f"local AI: download {' + '.join(localai.ROLE_NAMES[r] for r, _, _ in d['models'])} "
+                f"({d['need_bytes'] / localai.GB:.0f} GB) in the background after setup; TokenSaver works "
+                "without it meanwhile and starts using it by itself")
+    notes = ["about 0.5-1% more saving; the models pause while the machine is busy or on battery",
+             "`tokensaver local-ai off` stops it"] if d["models"] else []
+    if d["ollama"] == "ours" and d["missing"]:
+        notes.append(f"ollama {localai.OLLAMA_VERSION} goes into {localai.DIR} (no sudo), "
+                     "as a background service on its own port")
 
     def apply():
-        for cmd in actions:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-            if r.returncode != 0:
-                raise RuntimeError(f"{' '.join(cmd)}: {r.stderr[-300:]}")
-        if ollama_models() is None:
-            if shutil.which("brew") and service.platform() == "macos":
-                subprocess.run(["brew", "services", "start", "ollama"], capture_output=True, timeout=60)
-            else:
-                subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
-            for _ in range(40):
-                if ollama_models() is not None:
-                    break
-                time.sleep(0.5)
-        if model is None:
-            return
-        r = subprocess.run(["ollama", "pull", model], capture_output=True, text=True, timeout=3 * 3600)
-        if r.returncode != 0:
-            raise RuntimeError(f"`ollama pull {model}` failed: {r.stderr[-300:]}")
-    what = f"download {model} (~22 GB) for the deep prune and its check" if model else "start ollama"
-    return Step("ollama", "todo", f"{what} (local, free); {fits}" if model else f"{what}; {fits}", apply, notes)
+        # Optional: a problem here is reported and never stops the rest of setup.
+        try:
+            if mode == "off":
+                localai.set_mode("off")
+            if mode:
+                config.set_value("local_ai", mode, "user", why=SETUP_WHY)
+            if not d["skip"]:
+                localai.configure(d)
+                localai.start()
+        except Exception as exc:
+            print(f"  local AI not started ({type(exc).__name__}: {exc}); everything else is unaffected")
+    return Step("local-ai", status, what, apply if status == "todo" else None, notes)
 
 
 # ---- the plan -------------------------------------------------------------------
 
 def plan(route: str = "settings", shell_rc: str = "yes", audit: str | None = None, service: bool = True,
          with_hooks: bool = False, aliases: str = "try", statusbar: str = "yes",
-         with_prune: bool = False) -> list[Step]:
-    from . import background, machine, routing
+         local_ai: str | None = None) -> list[Step]:
+    from . import machine, routing
     from . import service as svc
     steps: list[Step] = []
     notes = []
@@ -363,18 +340,12 @@ def plan(route: str = "settings", shell_rc: str = "yes", audit: str | None = Non
                       f"claude at {shutil.which('claude')}; {svc.platform()}, "
                       f"{machine.ram_bytes() / 2 ** 30:.0f} GB memory", notes=notes))
 
-    gate_model = background.gate_model_for(machine.ram_bytes(), svc.platform())
     billing = billing_type()
     audit_on = audit or "on"
     want = {"rewrite": "forward", "bg_compact": True, "audit": audit_on}
-    if with_prune and gate_model:
-        want["local_model"] = gate_model
     if chain:
         want["upstream"] = upstream
-    cfg_notes = ["background compaction on (rules only, no model needed)" +
-                 ("; --with-prune adds local-model pruning" if not with_prune else
-                  f"; pruning with Nimble" + (f" and {gate_model} (deep prune + its check)" if gate_model else
-                                              " (fast prune; no 35B fits, so unchecked)")),
+    cfg_notes = ["background compaction on (rules only, no model needed)",
                  f"free token counts {audit_on} (Anthropic's count_tokens on your own login, {billing}): "
                  "they measure the saving and decide each compaction"]
     current = {k: config.get(k) for k in want}
@@ -385,9 +356,6 @@ def plan(route: str = "settings", shell_rc: str = "yes", audit: str | None = Non
             config.set_value(k, v, "user", why=SETUP_WHY)
     steps.append(Step("config", "todo" if todo else "already",
                       ", ".join(f"{k}={v}" for k, v in want.items()), apply_config, cfg_notes))
-    if with_prune:
-        ollama = ollama_step(gate_model)
-        steps.append(ollama)
 
     if with_hooks:
         from . import install
@@ -424,8 +392,7 @@ def plan(route: str = "settings", shell_rc: str = "yes", audit: str | None = Non
     else:
         steps.append(_alias_step(shell_rc, aliases))
 
-    if with_prune:
-        steps.append(prune_step(ollama_first=ollama.status == "todo"))
+    steps.append(local_ai_step(local_ai))
     steps.append(statusline_step(statusbar))
     steps.append(Step("verify", "todo", "conformance suite (local, free) and the live health check",
                       lambda: verify(route)))
@@ -503,28 +470,6 @@ def _alias_step(shell_rc: str, aliases: str) -> Step:
                 apply_rc, rc_notes)
 
 
-def prune_step(ollama_first: bool = False) -> Step:
-    """The decision model smart pruning uses (`--with-prune`, ~9 GB; ~0.5-1% more)."""
-    from . import machine, prune
-    judge = config.get("prune_judge")
-    inst = prune.installed()
-    if not inst and not ollama_first and ollama_models() is None:
-        return Step("prune", "skip", "smart prune needs ollama (not running)")
-    if prune._name(judge, inst):
-        t, why = prune.tier()
-        return Step("prune", "already", f"smart prune: tier {t} ({why})")
-    ram = machine.ram_bytes()
-    if ram and ram < 24 * 2 ** 30:        # Nimble measured ~16 GB loaded, plus 6 GB headroom
-        return Step("prune", "skip", f"smart prune needs 24 GB+ of memory; this machine has {ram / 2**30:.0f} GB")
-
-    def pull():
-        r = subprocess.run(["ollama", "pull", judge], capture_output=True, text=True, timeout=3 * 3600)
-        if r.returncode != 0:
-            raise RuntimeError(f"`ollama pull {judge}` failed: {r.stderr[-300:]}")
-    return Step("prune", "todo", f"download {judge} (~9 GB, Apache-2.0) so idle compactions also drop "
-                                 f"superseded history (eases off when the machine strains)", pull)
-
-
 def verify(route: str = "settings") -> None:
     from . import service as svc
     r = subprocess.run([sys.executable, str(REPO / "experiments" / "proxy_conformance.py")],
@@ -557,16 +502,16 @@ def render(steps: list[Step]) -> str:
 
 def run(dry_run: bool = False, yes: bool = False, route: str = "settings", shell_rc: str = "yes",
         audit: str | None = None, service: bool = True, with_hooks: bool = False, aliases: str = "try",
-        statusbar: str = "yes", with_prune: bool = False, refresh: bool = False) -> int:
+        statusbar: str = "yes", local_ai: str | None = None, refresh: bool = False) -> int:
     """Show the whole plan, ask once, apply. Without a terminal and without
     --yes, print the plan and exit 3 (a Claude session shows it and asks).
     `refresh` (after `update`): the recorded install again, no questions, and
     the proxy restarted so it runs the new code."""
     if refresh:
         rec = config.section("install") or {}
-        route, yes, with_prune = rec.get("route") or route, True, bool(rec.get("with_prune"))
+        route, yes = rec.get("route") or route, True
     steps = plan(route=route, shell_rc=shell_rc, audit=audit, service=service, with_hooks=with_hooks,
-                 aliases=aliases, statusbar=statusbar, with_prune=with_prune)
+                 aliases=aliases, statusbar=statusbar, local_ai=local_ai)
     print("TokenSaver setup\n")
     print(render(steps))
     if any(s.status == "failed" for s in steps) or (steps and steps[0].status == "skip"):
@@ -595,8 +540,7 @@ def run(dry_run: bool = False, yes: bool = False, route: str = "settings", shell
     from . import service as svc
     config.set_section("install", {"repo": str(REPO), "python": svc.python(), "route": route,
                                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                   "service": svc.installed(), "rc": str(rc_file()) if route == "alias" else None,
-                                   "with_prune": with_prune})
+                                   "service": svc.installed(), "rc": str(rc_file()) if route == "alias" else None})
     if refresh:
         print("proxy restarted on the new code" if svc.restart() else
               "the proxy did not come back after the update (the watchdog keeps Claude Code working direct); "
@@ -670,6 +614,11 @@ def uninstall(purge: bool | None = None, yes: bool = False) -> int:
     step("update entries written before the rename", lambda: (migrate.rewrite_names(), None)[1])
     step("take routing out of settings.json", routing_off)
     step("stop and remove the service", svc.remove)
+    from . import localai
+    pulled_into_theirs = [] if localai.DIR.exists() else localai.load_state().get("pulled") or []
+    # Our own ollama and its models exist only for TokenSaver (tens of GB): they go
+    # unless the data is kept on purpose. An ollama the user installed is not touched.
+    step("remove TokenSaver's ollama", lambda: localai.remove(keep_files=purge is False))
     step("remove the old-name service", svc.remove_old)
     step("restore the status line", _restore_statusline)
     step("remove the hooks", lambda: (lambda m: None if m.startswith("nothing to remove") else m)(install.uninstall()))
@@ -711,7 +660,9 @@ def uninstall(purge: bool | None = None, yes: bool = False) -> int:
         print(f"  deleted {home}" + (" (including this copy of TokenSaver)" if inside else ""))
     elif not svc.LEFT_RUNNING:
         print(f"  kept {home} (your recorded sessions); delete it any time")
-    print("  left in place: ollama and any models it pulled (`ollama rm <model>` if unused)")
+    if pulled_into_theirs:
+        print(f"  left in place: your own ollama, and the models TokenSaver pulled into it: "
+              f"{', '.join(pulled_into_theirs)} (`ollama rm <model>` if unused)")
     if not purge and Path(os.path.realpath(REPO)) != Path(os.path.realpath(home / "src")):
         print(f"  the code itself is still at {REPO}; delete that folder to finish")
     print("\nTokenSaver is removed" + (" (with the failures above)" if failed else "") +

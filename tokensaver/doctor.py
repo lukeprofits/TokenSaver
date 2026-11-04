@@ -218,6 +218,8 @@ def _proxy_lines() -> list[str]:
         t, why = prune.tier()
         inst = prune.installed()
         mem = (config.section("prune").get("memory") or {})
+        from . import localai
+        L.append(f"    local AI: {localai.describe()} (setting {config.get('local_ai')})")
         L.append(f"    smart prune: tier {t} ({why}); judge {config.get('prune_judge')} "
                  f"{'installed' if prune._name(config.get('prune_judge'), inst) else 'NOT installed'}, "
                  f"delete at p >= {config.get('prune_min_p')}")
