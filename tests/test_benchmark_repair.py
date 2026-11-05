@@ -20,9 +20,22 @@ def violations(messages: list) -> list[str]:
     """The API's rules the benchmark tripped on: block types count_tokens takes without
     tools, and each tool call's result leading the very next user message."""
     out = []
+    seen_ids = set()
     for i, m in enumerate(messages):
-        for b in m["content"]:
+        if i and messages[i - 1]["role"] == m["role"]:
+            out.append(f"messages.{i}: roles must alternate between \"user\" and \"assistant\"")
+        if not m["content"]:
+            out.append(f"messages.{i}: all messages must have non-empty content")
+        for k, b in enumerate(m["content"]):
             t = b.get("type")
+            if t == "tool_use":
+                if b.get("id") in seen_ids:
+                    out.append(f"messages.{i}.content.{k}: `tool_use` ids must be unique")
+                seen_ids.add(b.get("id"))
+            if t == "text" and not b.get("text", "").strip():
+                out.append(f"messages.{i}.content.{k}: text content blocks must be non-empty")
+            if t in ("thinking", "redacted_thinking") and m["role"] != "assistant":
+                out.append(f"messages.{i}.content.{k}: thinking only in assistant messages")
             if t not in benchmark.COUNTABLE_TYPES:
                 out.append(f"messages.{i}: {t} not accepted")
             if t == "tool_result" and isinstance(b.get("content"), list):

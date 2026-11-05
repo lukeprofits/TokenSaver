@@ -180,19 +180,32 @@ def _request(rec: dict, u: dict) -> Request:
     )
 
 
-def api_history(path: Path) -> tuple[list[dict], list[tuple[int, Request, int]]]:
+def api_history(path: Path, info: dict | None = None) -> tuple[list[dict], list[tuple[int, Request, int]]]:
     """(messages, requests) for the main conversation, in one pass so they
     always line up: `messages` as the API sees them (consecutive same-role
     records merged), and for each billed main request the number of messages
     it sent with its usage. Subagent records (`isSidechain`) are left out of
     both. At Claude Code's own compaction (`compact_boundary`) the history
     starts over, as the API's does; the index restarts with it, so a request
-    sends `messages[epoch_start:epoch_start + n]` (see `request_messages`)."""
+    sends `messages[epoch_start:epoch_start + n]` (see `request_messages`).
+    `info`, if given, gets "duplicates" (repeated records or tool calls left out)
+    and "boundaries" ([(epoch start, time of Claude Code's compaction)])."""
     messages: list[dict] = []
     ids: list = []                 # each message's reply id (assistant), kept beside it, never sent
     requests: list[tuple[int, Request, int]] = []
     seen: set[str] = set()
     start = 0
+    # Some transcripts hold the same record, or the same tool call, twice (seen on another
+    # machine: 210 of 1,776 counts refused with "`tool_use` ids must be unique"). The API saw
+    # each once, so a repeat is left out: by record uuid, and by tool call / result id
+    # within the current history.
+    uuids: set = set()
+    calls: set = set()
+    results: set = set()
+    dup = 0
+    bounds: list = []
+    if info is not None:
+        info["duplicates"], info["boundaries"] = 0, bounds
     try:
         fh = path.open(errors="replace")
     except OSError:
@@ -207,6 +220,8 @@ def api_history(path: Path) -> tuple[list[dict], list[tuple[int, Request, int]]]
                 continue
             if rec.get("subtype") == "compact_boundary":
                 start = len(messages)
+                calls, results = set(), set()
+                bounds.append((start, rec.get("timestamp")))
                 continue
             msg = rec.get("message")
             if not isinstance(msg, dict):
@@ -214,6 +229,12 @@ def api_history(path: Path) -> tuple[list[dict], list[tuple[int, Request, int]]]
             role, content = msg.get("role"), msg.get("content")
             if role not in ("user", "assistant") or content is None:
                 continue
+            uid = rec.get("uuid")
+            if uid:
+                if uid in uuids:
+                    dup += 1
+                    continue
+                uuids.add(uid)
             mid = msg.get("id")
             if role == "assistant" and mid and mid not in seen:
                 seen.add(mid)
@@ -223,6 +244,22 @@ def api_history(path: Path) -> tuple[list[dict], list[tuple[int, Request, int]]]
                     if req.context or req.out:
                         requests.append((len(messages), req, start))
             items = content if isinstance(content, list) else [{"type": "text", "text": content}]
+            kept = []
+            for b in items:
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id"):
+                    if b["id"] in calls:
+                        dup += 1
+                        continue
+                    calls.add(b["id"])
+                elif isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id"):
+                    if b["tool_use_id"] in results:
+                        dup += 1
+                        continue
+                    results.add(b["tool_use_id"])
+                kept.append(b)
+            if not kept:
+                continue
+            items = kept
             # Parallel tool calls: Claude Code writes a tool's result as soon as
             # that tool finishes, while later tool_use blocks of the SAME reply
             # are still being written (file order: call 1, call 2, result 1,
@@ -243,6 +280,8 @@ def api_history(path: Path) -> tuple[list[dict], list[tuple[int, Request, int]]]
             else:
                 messages.append({"role": role, "content": list(items)})
                 ids.append(mid if role == "assistant" else None)
+    if info is not None:
+        info["duplicates"] = dup
     return messages, requests
 
 

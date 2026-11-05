@@ -42,6 +42,11 @@ def main(proven: bool = True) -> int:
             bill += (r.inp * p.inp + r.read * p.read + r.write_1h * p.write_1h + r.write_5m * p.write_5m
                      + r.out * p.out) / 1e6
         returned = False
+        # Claude Code compacts a session by itself about 55 minutes into a break: live,
+        # keep-alive lets go there (a new history is written whatever the cache holds).
+        info: dict = {}
+        transcripts.api_history(s.path, info)
+        cuts = sorted(sim._ts(ts) for _, ts in info.get("boundaries") or [] if ts)
         for k, r in enumerate(rq):
             t = sim._ts(r.timestamp)
             g = sim._ts(rq[k + 1].timestamp) - t if k + 1 < len(rq) else None
@@ -53,7 +58,9 @@ def main(proven: bool = True) -> int:
             moments += 1
             if not big:
                 continue
-            b, warm = ka.replay_bumps(t, g, big, ends, proven_here=proven)
+            cut = next((c for c in cuts if t < c and (g is None or c < t + g)), None)
+            b, warm = ka.replay_bumps(t, g if cut is None else cut - t, big, ends, proven_here=proven)
+            warm = warm and cut is None
             cost = b * r.context * p.read / 1e6
             spent += cost
             if warm:

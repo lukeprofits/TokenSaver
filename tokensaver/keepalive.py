@@ -731,6 +731,28 @@ def _forget(session: str) -> None:
 forget = _forget
 
 
+def compacted(session: str | None, started: float, usage: dict) -> None:
+    """Claude Code compacted this session (a `compaction`-class request): the history it
+    sends next starts over, so the held prefix is dead and is never bumped again. Claude
+    Code does this by itself about 55 minutes into a break (4 of 5 compactions here), just
+    before a 58-minute bump. If bumps already ran, someone came back (e.g. typed /compact):
+    the break settles on whether this request read the cache. Never raises."""
+    try:
+        if not session:
+            return
+        with _LOCK:
+            prev = _SESSIONS.pop(session, None)
+            _WARM.pop(session, None)
+        if prev and prev.get("bumps"):
+            read = int((usage or {}).get("cache_read_input_tokens") or 0)
+            kept = read >= HIT_SHARE * prev["size"]
+            _record_break(session, prev, started, kept=kept)
+            if started - prev["started"] > H and prev.get("last_bump") and started < prev["last_bump"] + H - 60:
+                _prove(kept)
+    except Exception:
+        pass
+
+
 def held() -> list[dict]:
     """For the health check: which sessions may be bumped and when next. No login data."""
     with _LOCK:

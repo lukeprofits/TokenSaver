@@ -2093,6 +2093,10 @@ class Handler(BaseHTTPRequestHandler):
                 keepalive.remember(session, self.path, sent, headers, started,
                                    getattr(self, "_usage", {}) or {}, getattr(self, "_model", None),
                                    rate_limits, bool((getattr(self, "_rewrite_stats", {}) or {}).get("bg_applied")))
+            elif (messages_call and status == 200 and session
+                    and self.headers.get("x-claude-code-request-class") == "compaction"
+                    and not self.headers.get("x-claude-code-agent-id")):
+                keepalive.compacted(session, started, getattr(self, "_usage", {}) or {})
         except Exception:
             pass
         try:

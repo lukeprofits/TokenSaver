@@ -1239,6 +1239,31 @@ def main() -> int:
         _routing.state = saved_rs
         proxy.REWRITE = ""
 
+    print("\n23. keep-alive lets go of a session Claude Code compacts itself")
+    from tokensaver import keepalive as _ka
+
+    def hold(s):
+        _ka._SESSIONS[s] = {"path": "/v1/messages", "sent": b"{}", "headers": {}, "started": time.time() - 55 * 60,
+                            "size": 400_000, "model": "claude-opus-5-5", "bumps": 0, "spent": 0.0,
+                            "last_bump": None, "misses": 0, "inflight": False}
+    try:
+        hold("s23")
+        post(base + "/v1/messages", body, dict(headers, **{"x-claude-code-session-id": "s23",
+                                                           "x-claude-code-request-class": "auxiliary"}))
+        time.sleep(0.5)                        # its after-relay work is done
+        check("a side request leaves the held session alone", "s23" in _ka._SESSIONS,
+              "keep-alive would stop for every recap or suggestion")
+        post(base + "/v1/messages", body, dict(headers, **{"x-claude-code-session-id": "s23",
+                                                           "x-claude-code-request-class": "compaction"}))
+        for _ in range(40):                    # the handler lets go after the relay finished
+            if "s23" not in _ka._SESSIONS:
+                break
+            time.sleep(0.05)
+        check("Claude Code's own compaction ends the hold (no bump on a dead prefix)", "s23" not in _ka._SESSIONS,
+              "a bump 3 minutes later keeps a cache nobody reads (seen live: $0.08 for a 407K prefix)")
+    finally:
+        _ka._SESSIONS.pop("s23", None)
+
     px.shutdown(); up.shutdown()
     print()
     if failures:

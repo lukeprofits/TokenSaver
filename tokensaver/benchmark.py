@@ -171,14 +171,46 @@ def _items(m: dict) -> list:
     return list(c) if isinstance(c, list) else [{"type": "text", "text": c if isinstance(c, str) else ""}]
 
 
-def countable(messages: list, strict: set | None = None) -> tuple[list, dict]:
-    """(a copy count_tokens accepts, {"converted", "moved", "placeholder", "stray"}).
-    `strict`: canonical-JSON hashes of messages to turn entirely into text (a 400 named them)."""
+def countable(messages: list, strict: dict | set | None = None) -> tuple[list, dict]:
+    """(a copy count_tokens accepts, {"converted", "moved", "placeholder", "stray", "duplicate",
+    "empty", "merged"}). Every rule the counter has refused a history for is checked here
+    first, so a known problem never costs a refused count.
+    `strict`: canonical-JSON hash of a message a 400 named -> level. 1: only basic block types
+    and fields; 2: every block of it as text (its tool calls too, so their results become
+    text as well). A set means level 1 for each."""
     rep: dict = {}
+    levels = dict.fromkeys(strict, 1) if isinstance(strict, set) else (strict or {})
     out = []
+    seen_calls: set = set()
     for n, m in enumerate(messages):
-        s = bool(strict) and _msg_hash(m) in strict
-        out.append({"role": m.get("role"), "content": [_convert(b, rep, s) for b in _items(m)], "_src": n})
+        lvl = levels.get(_msg_hash(m), 0) if levels else 0
+        role = m.get("role")
+        content = []
+        for b in _items(m):
+            if lvl >= 2 and isinstance(b, dict) and b.get("type") != "text":
+                rep["converted"] = rep.get("converted", 0) + 1
+                b = _as_text(b)
+            b = _convert(b, rep, lvl >= 1)
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type")
+            if t == "text" and not str(b.get("text") or "").strip():
+                rep["empty"] = rep.get("empty", 0) + 1          # "text content blocks must be non-empty"
+                continue
+            if t in ("thinking", "redacted_thinking") and role != "assistant":
+                rep["converted"] = rep.get("converted", 0) + 1
+                b = _as_text(b)
+            if t == "tool_use":
+                if b.get("id") in seen_calls:                  # "`tool_use` ids must be unique"
+                    rep["duplicate"] = rep.get("duplicate", 0) + 1
+                    continue
+                seen_calls.add(b.get("id"))
+            content.append(b)
+        if out and out[-1]["role"] == role:                     # roles must alternate
+            rep["merged"] = rep.get("merged", 0) + 1
+            out[-1]["content"] += content
+        else:
+            out.append({"role": role, "content": content, "_src": n})
     # Pairing: the results for an assistant message's tool calls lead the next user message.
     i = 0
     while i < len(out):
@@ -228,7 +260,16 @@ def countable(messages: list, strict: set | None = None) -> tuple[list, dict]:
         i += 1
     # A message left empty by a move is not sent empty; `_src` (where each came from) is
     # kept aside for the caller.
-    out = [m for m in out if m["content"]]
+    kept: list = []
+    for m in out:
+        if not m["content"]:
+            continue
+        if kept and kept[-1]["role"] == m["role"]:            # an empty one between them is gone
+            rep["merged"] = rep.get("merged", 0) + 1
+            kept[-1]["content"] += m["content"]
+        else:
+            kept.append(m)
+    out = kept
     rep["_origin"] = [m.pop("_src") for m in out]
     return out, rep
 
@@ -308,12 +349,14 @@ class Counter:
         self.repairs: dict[str, int] = {}
         self.repaired_sessions = 0
         self.rejections: list[dict] = []
-        self.strict: set[str] = set()
+        self.strict: dict[str, int] = {}
+        self.escalated: dict[int, int] = {}      # strict level -> messages raised to it
 
     def __call__(self, model: str, messages: list, thinking: bool = False, patient: bool = False) -> int | None:
         self.calls += 1
         budget = RATE_BUDGET_S if patient else SAMPLE_BUDGET_S
-        for attempt in range(2):
+        first = None
+        for attempt in range(5):
             fixed, rep = countable(messages, self.strict)
             body = audit.payload(json.dumps({"model": model, "messages": fixed}).encode(),
                                  no_thinking=not thinking)
@@ -322,15 +365,24 @@ class Counter:
                 for k, v in rep.items():
                     if not k.startswith("_"):
                         self.repairs[k] = self.repairs.get(k, 0) + v
+                if first:
+                    self._reject(*first, recovered=True)   # counted, but worth fixing at the source
                 return tokens
             m = _MSG_INDEX.search(err)
-            if err.startswith("400") and m and attempt == 0:
-                # Turn the named message entirely into text for this and every later count.
+            if err.startswith("400") and first is None:
+                # The shape as first refused (later tries are stricter and would hide the cause).
+                first = (err, shape(body["messages"], int(m.group(1)) if m else None))
+            if err.startswith("400") and m:
+                # Make the named message stricter, for this and every later count: first only
+                # basic blocks and fields, then all of it as text. Text always counts, so a
+                # history shape not seen before costs a retry, not the count.
                 idx = int(m.group(1))
                 origin = rep.get("_origin") or []
                 src = origin[idx] if idx < len(origin) else None
-                if src is not None and _msg_hash(messages[src]) not in self.strict:
-                    self.strict.add(_msg_hash(messages[src]))
+                h = _msg_hash(messages[src]) if src is not None else None
+                if h is not None and self.strict.get(h, 0) < 2:
+                    self.strict[h] = self.strict.get(h, 0) + 1
+                    self.escalated[self.strict[h]] = self.escalated.get(self.strict[h], 0) + 1
                     continue
             break
         if err.startswith("rate limited"):
@@ -340,9 +392,15 @@ class Counter:
             self.failed += 1
             self.errors[err] = self.errors.get(err, 0) + 1
             m = _MSG_INDEX.search(err)
-            if len(self.rejections) < 5 and not any(r["error"] == err for r in self.rejections):
-                self.rejections.append({"error": err, "shape": shape(body["messages"], int(m.group(1)) if m else None)})
+            self._reject(*(first or (err, shape(body["messages"], int(m.group(1)) if m else None))))
         return None
+
+    def _reject(self, err: str, where: list, recovered: bool = False) -> None:
+        """Keep up to 5 refusals of each kind (failed / recovered by a retry), one per error."""
+        kind = [r for r in self.rejections if bool(r.get("recovered")) == recovered]
+        key = re.sub(r"\d+", "N", err)
+        if len(kind) < 5 and not any(re.sub(r"\d+", "N", r["error"]) == key for r in kind):
+            self.rejections.append(dict({"error": err, "shape": where}, **({"recovered": True} if recovered else {})))
 
     def _pace(self, headers) -> None:
         h = {k.lower(): v for k, v in (headers or {}).items()}
@@ -590,9 +648,13 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     kept_warm: set[int] = set()
     bump_events: list[tuple[int, int]] = []     # (request the bumps followed, how many)
     returned = False
-    messages, entries = transcripts.api_history(d.session.path)
+    tinfo: dict = {}
+    messages, entries = transcripts.api_history(d.session.path, tinfo)
     if not entries:
         return {"skipped": "no billed requests"}
+    # When Claude Code compacted the history during a break (it does so by itself about 55
+    # minutes in): live, keep-alive stops holding the session there (the old cache is dead).
+    compacted_at = {start: sim._ts(ts) for start, ts in tinfo.get("boundaries") or [] if ts}
     reqs = [e[1] for e in entries]
     model = d.session.primary_model
     prices = [pricing.price_for(r.model) or d.price for r in reqs]
@@ -672,8 +734,12 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                 # The break before this request: would keep-alive have kept the cache, and at what cost?
                 big = k >= ka.BIG_REQUESTS or returned or reqs[k - 1].context >= ka.BIG_TOKENS
                 warm_trim = decided is not None and decided[2] < decided[1] and decided[3] <= payback
-                n, warm = ka.replay_bumps(sim._ts(reqs[k - 1].timestamp), gap, big, keepalive_ends,
-                                          worth_it=not warm_trim)
+                t_prev = sim._ts(reqs[k - 1].timestamp)
+                ka_gap, new_history = gap, entry[2] != entries[k - 1][2]
+                if new_history and entry[2] in compacted_at:
+                    ka_gap = max(compacted_at[entry[2]] - t_prev, 0)
+                n, warm = ka.replay_bumps(t_prev, ka_gap, big, keepalive_ends, worth_it=not warm_trim)
+                warm = warm and not new_history     # a new history is written whatever the cache holds
                 if n:
                     bump_events.append((k - 1, n))
                 if warm:
@@ -764,6 +830,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                      for k in kept_warm if k not in rebuilt)
     return {"requests": len(reqs), "model": model, "breaks": breaks, "counted": len(removed_at),
             "decisions": decisions, "compactions": len(applied_at), "count_failures": failed,
+            "transcript_duplicates": tinfo.get("duplicates", 0),
             "plain_tokens": sum(plain), "ours_tokens": sum(ours),
             "plain_cost": round(price(plain, set()), 4),
             "ours_cost": round(price(ours, rebuilt, kept_warm, bump_events), 4),
@@ -1062,6 +1129,11 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               (" history repairs so Anthropic's counter accepts it (the same on both sides): "
                + ", ".join(f"{v} {k}" for k, v in sorted(count.repairs.items()))
                + f" in {count.repaired_sessions} sessions") if count.repairs else " history repairs: none needed",
+              *([f" transcripts: {dups:,} repeated records or tool calls left out (the API saw each once)"]
+                if (dups := sum(r.get("transcript_duplicates") or 0 for r in rows)) else []),
+              *([" refused counts retried with the named message made stricter: "
+                 + ", ".join(f"{v} at level {k}" for k, v in sorted(count.escalated.items()))]
+                if count.escalated else []),
               keepalive_line(ok, ka_ends),
               # no same-quote nesting inside f-strings: Python before 3.12 (macOS's own 3.9) rejects it
               " thinking: " + ", ".join(f"{_version(m)} {fa['value']:.3f} ({fa['source']})"
@@ -1076,7 +1148,9 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               "thinking_factors": factors,
               "counts": {"calls": count.calls, "failed": count.failed, "rate_limited": count.rate_limited,
                          "attempts": count.attempts, "repairs": count.repairs,
-                         "repaired_sessions": count.repaired_sessions},
+                         "repaired_sessions": count.repaired_sessions,
+                         "escalated": {str(k): v for k, v in sorted(count.escalated.items())},
+                         "transcript_duplicates": sum(r.get("transcript_duplicates") or 0 for r in rows)},
               "rejections": count.rejections,
               "summary": lines[1:], "sessions": rows}
     OUT_DIR.mkdir(parents=True, exist_ok=True)
