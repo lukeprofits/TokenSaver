@@ -1568,22 +1568,36 @@ DECIDE_TIMEOUT_S = 2.5
 def _count_all(bodies: dict, headers: dict, path: str) -> dict:
     hdrs = {k.lower(): v for k, v in (headers or {}).items() if k.lower() in audit.HEADER_FIELDS}
     got: dict = {}
+    why: dict = {}
 
     def one(name, req):
         try:
+            # count_copy: Claude Code's message-level `output_config` and `thinking.display`
+            # are taken by the Messages API and refused by count_tokens (neither is billed
+            # input). Measured 2026-11-05: a cold decision got no counts at all (0.33 s) and
+            # applied on the estimate, which then sent 9K tokens MORE content than it removed.
             body = audit.payload(json.dumps(req).encode())
-            n, _, _ = audit._count(path, hdrs, body) if body else (None, 0, {})
+            n, code, _ = audit._count(path, hdrs, audit.count_copy(body)) if body else (None, 0, {})
             if n:
                 got[name] = n
-        except Exception:
-            pass
+            else:
+                why[name] = f"{code} {audit._state.get('last_error') or ''}".strip()[:120]
+        except Exception as exc:
+            why[name] = type(exc).__name__
     threads = [threading.Thread(target=one, args=(k, v), daemon=True) for k, v in bodies.items()]
     for t in threads:
         t.start()
     end = time.time() + DECIDE_TIMEOUT_S
     for t in threads:
         t.join(max(0.0, end - time.time()))
-    return dict(got)
+    out = dict(got)
+    if why:
+        _COUNT_WHY.clear()
+        _COUNT_WHY.update(why)
+    return out
+
+
+_COUNT_WHY: dict = {}      # why the last decision's counts failed (recorded with the decision)
 
 
 def _decide(session: str, request: dict, original: list, cold: bool, headers: dict,
@@ -1604,8 +1618,11 @@ def _decide(session: str, request: dict, original: list, cold: bool, headers: di
     if plan:
         bodies["plan"] = dict(cand, messages=passes.rewrite_messages(compacted, aliases=plan, exclude=exclude))
     t0 = time.time()
+    _COUNT_WHY.clear()
     n = _count_all(bodies, headers, path)
     info: dict = {"bg_counts": n, "bg_count_s": round(time.time() - t0, 2)}
+    if _COUNT_WHY:
+        info["bg_count_errors"] = dict(_COUNT_WHY)
     if "now" not in n or "off" not in n:
         ok, why = (True, "cache expired") if cold else _warm_ok(pending)
         if ok and cold and not _estimate_margin_ok(pending):

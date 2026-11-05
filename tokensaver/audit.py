@@ -374,6 +374,38 @@ def signature_factor(model: str | None = None) -> tuple[float, str, dict]:
         {"n": len(vals), "sessions": len(sess), "source": "default"}
 
 
+_LOW_CACHE: dict = {}
+
+
+def low_signature_factor(model: str | None) -> float:
+    """The LOWEST rate measured for this model on this machine (else the default), for
+    crediting TokenSaver with thinking it removed: a saving claim errs low. Measured
+    2026-11-05: Opus 5.5 0.110-0.125 on sent requests while the default (used until 10
+    measurements exist) is 0.264. Cached 1 h."""
+    hit = _LOW_CACHE.get(model)
+    if hit and time.time() - hit[1] < 3600:
+        return hit[0]
+    from .background import TOKENS_PER_SIGNATURE_CHAR as default
+    v = default
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{vault.DB_PATH}?mode=ro", uri=True, timeout=5)
+        try:
+            since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - SIG_WINDOW_DAYS * 86400))
+            vals = [json.loads(m or "{}") for (m,) in conn.execute(
+                "SELECT meta FROM events WHERE kind='thinking_factor' AND ts >= ?", (since,))]
+        finally:
+            conn.close()
+        got = [m["factor"] for m in vals if m.get("model") == model and isinstance(m.get("factor"), (int, float))
+               and SIG_BOUNDS[0] <= m["factor"] <= SIG_BOUNDS[1]]
+        if got:
+            v = min(min(got), default)
+    except Exception:
+        pass
+    _LOW_CACHE[model] = (v, time.time())
+    return v
+
+
 def _toggled(orig: dict, name: str, base: tuple) -> tuple[dict | None, bool]:
     """(the request as built with pass `name` toggled, whether it was on).
 
@@ -437,6 +469,21 @@ def _worker() -> None:
             pass
 
 
+def _stripped_thinking(job: dict) -> int:
+    """Tokens of thinking in the original request that the sent one no longer carries."""
+    try:
+        from . import background
+        o = json.loads(job["body"]).get("messages") or []
+        s = json.loads(job["sent"]).get("messages") or []
+        chars = background._signature_chars(o) - background._signature_chars(s)
+        if chars <= 0:
+            return 0
+        model = json.loads(job["body"]).get("model")
+        return round(chars * low_signature_factor(model))
+    except Exception:
+        return 0
+
+
 def _run(job: dict) -> None:
     orig, sent = payload(job["body"], no_thinking=True), payload(job["sent"], no_thinking=True)
     if orig is None or sent is None:
@@ -465,7 +512,13 @@ def _run(job: dict) -> None:
             return
         real = n
     content_nt = list(counts)          # (original, sent), thinking removed from both
-    counts = [real + (content_nt[0] - content_nt[1]), real]
+    # Plain Claude Code also pays for earlier thinking that TokenSaver stripped at a
+    # compaction (the kept tail's, by the preserved-thinking rule). The counts above are
+    # thinking-free, so add it, priced at this model's measured rate. Measured 2026-11-05:
+    # without this, a compaction that removed ~15K tokens of thinking and added ~9K of
+    # content showed as -5% in the status line.
+    thinking_removed = _stripped_thinking(job)
+    counts = [real + (content_nt[0] - content_nt[1]) + thinking_removed, real]
     rs = job["rstats"]
     # Per-pass attribution, so each pass's token effect is measured, not
     # guessed (measured first: bytes fell 0.7% while tokens rose 1.5%; path
@@ -511,7 +564,7 @@ def _run(job: dict) -> None:
                        "without": without, "passes": per_pass, "aliases": rs.get("aliases"),
                        "attribution_base": "as_built" if base else "original",
                        "method": "no_thinking", "tokens_original_nt": content_nt[0],
-                       "tokens_sent_nt": content_nt[1]},
+                       "tokens_sent_nt": content_nt[1], "thinking_removed": thinking_removed},
                  index=False)
     try:
         _samples_job(job)
