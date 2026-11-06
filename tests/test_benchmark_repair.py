@@ -273,6 +273,13 @@ class KeepAliveReplayTest(unittest.TestCase):
     is a cache read instead of a rewrite, and every bump is paid for, including the ones
     after the session's last request."""
 
+    def setUp(self):
+        # As with Claude Code's idle compaction off (this session is 200K): bumps replayed.
+        from tokensaver import keepalive as ka
+        p = mock.patch.object(ka, "idle_compact_at", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
     def session(self):
         import time as _t
         from types import SimpleNamespace

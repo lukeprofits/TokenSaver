@@ -59,7 +59,8 @@ def main(proven: bool = True) -> int:
             if not big:
                 continue
             cut = next((c for c in cuts if t < c and (g is None or c < t + g)), None)
-            b, warm = ka.replay_bumps(t, g if cut is None else cut - t, big, ends, proven_here=proven)
+            b, warm = ka.replay_bumps(t, g if cut is None else cut - t, big, ends, proven_here=proven,
+                                      size=r.context)
             warm = warm and cut is None
             cost = b * r.context * p.read / 1e6
             spent += cost

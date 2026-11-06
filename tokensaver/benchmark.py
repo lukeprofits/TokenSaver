@@ -738,7 +738,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                 ka_gap, new_history = gap, entry[2] != entries[k - 1][2]
                 if new_history and entry[2] in compacted_at:
                     ka_gap = max(compacted_at[entry[2]] - t_prev, 0)
-                n, warm = ka.replay_bumps(t_prev, ka_gap, big, keepalive_ends, worth_it=not warm_trim)
+                n, warm = ka.replay_bumps(t_prev, ka_gap, big, keepalive_ends, worth_it=not warm_trim,
+                                          size=reqs[k - 1].context)
                 warm = warm and not new_history     # a new history is written whatever the cache holds
                 if n:
                     bump_events.append((k - 1, n))
@@ -793,7 +794,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         # live while the session stays open; a /clear or /exit closed it, so none then).
         last = len(reqs) - 1
         big = len(reqs) >= ka.BIG_REQUESTS or returned or reqs[last].context >= ka.BIG_TOKENS
-        n, _ = ka.replay_bumps(sim._ts(reqs[last].timestamp), None, big, keepalive_ends)
+        n, _ = ka.replay_bumps(sim._ts(reqs[last].timestamp), None, big, keepalive_ends,
+                              size=reqs[last].context)
         if n:
             bump_events.append((last, n))
 

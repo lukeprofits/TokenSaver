@@ -245,11 +245,12 @@ It stays out of the way:
 It's on by default, and each computer checks that it works there first: one
 read per break until a break comes back to a warm cache; if two breaks come
 back to a lost cache instead, it turns itself off. On this project's own
-history (28 days, interactive sessions only) it cut the bill by about 3% while
-checking and about 5% after (`python3 experiments/keepalive.py` replays yours;
-`tokensaver --benchmark` includes it). Claude Code compacts some sessions by
-itself about 55 minutes into a break; keep-alive lets go of those. On a Pro or
-Max plan, these reads count toward your plan's usage.
+history (29 days, interactive sessions only) it cut the bill by under 1%
+(`python3 experiments/keepalive.py` replays yours; `tokensaver --benchmark`
+includes it). That is small because Claude Code compacts a session of 200K
+tokens or more by itself about 55 minutes into a break (its `idleCompaction`
+setting, on by default), so keep-alive leaves those alone and only helps
+smaller ones. On a Pro or Max plan, these reads count toward your plan's usage.
 
 ```sh
 tokensaver keepalive        # on or off, when it stops today, what it saved and spent

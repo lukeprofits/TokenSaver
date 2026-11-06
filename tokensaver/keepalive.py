@@ -40,6 +40,7 @@ Setting `cache_keepalive`: auto | on | off. Never raises into the proxy.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import threading
@@ -72,6 +73,12 @@ MAX_BUMPS = 6
 BIG_REQUESTS = 50            # "big": this many requests, returned to after a break before,
 BIG_TOKENS = 150_000         # or this much context (a session first seen after a restart)
 MIN_SAVING_USD = 0.01        # a warm return worth less than this is not worth a request
+# Claude Code compacts a session left idle once its context reaches this (setting
+# `idleCompaction`, default on; CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, default 200K, never
+# below 100K). Seen here 54-59 min into a break, just before the cache would go: a bump
+# then keeps a cache nobody reads, so such sessions are not held at all.
+IDLE_COMPACT_TOKENS = 200_000
+IDLE_COMPACT_FLOOR = 100_000
 WARMUP_DAYS = 5              # past days of use before the day end is trusted
 WEEKDAY_MIN = 4              # same-weekday samples before that weekday's own day end is used
 DAY_END_Q = 0.75             # p75 of past day ends, minus MARGIN_H
@@ -151,12 +158,13 @@ def stop_hour(ends: dict, t: float) -> float | None:
 
 
 def replay_bumps(t0: float, gap: float | None, big: bool, ends: dict, worth_it: bool = True,
-                 proven_here: bool = True) -> tuple[int, bool]:
+                 proven_here: bool = True, size: int | None = None) -> tuple[int, bool]:
     """The rule above, replayed on history (the benchmark and experiments/keepalive.py use
     this, so they measure exactly what runs): (bumps sent after a request at `t0` whose
     session's next request came `gap` seconds later, or never (None); whether that return
-    found the cache warm). `worth_it` False: a trim would run on the return anyway."""
-    if not big or not worth_it:
+    found the cache warm). `worth_it` False: a trim would run on the return anyway.
+    `size`: the context then; one Claude Code compacts when idle is not held (as live)."""
+    if not big or not worth_it or (size is not None and compacted_when_idle(size)):
         return 0, False
     stop = stop_hour(ends, t0)
     limit = MAX_BUMPS if proven_here else PROVE_BUMPS
@@ -169,6 +177,40 @@ def replay_bumps(t0: float, gap: float | None, big: bool, ends: dict, worth_it: 
             break
         n, last = n + 1, bt
     return n, gap is not None and n > 0 and gap > H and t0 + gap <= last + H
+
+
+_IDLE_CACHE: list = [0.0, None]
+
+
+def idle_compact_at() -> int | None:
+    """The context size at which Claude Code compacts an idle session, or None when its
+    idle compaction is off. From Claude Code's managed and user settings (a project's own
+    settings cannot be told apart here) and their `env` blocks; the proxy cannot see the
+    shell Claude Code was started from, so a threshold set only there reads as the default."""
+    now = time.time()
+    if now - _IDLE_CACHE[0] < 60:
+        return _IDLE_CACHE[1]
+    from . import claude_settings as cs
+    on, raw = True, os.environ.get("CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS")
+    for path in [cs.SETTINGS] + cs.managed_paths():          # managed last: it wins
+        data = cs.read_json(path) or {}
+        if data.get("idleCompaction") is False:
+            on = False
+        elif data.get("idleCompaction") is True:
+            on = True
+        raw = (data.get("env") or {}).get("CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS", raw) \
+            if isinstance(data.get("env"), dict) else raw
+    try:
+        at = max(int(raw), IDLE_COMPACT_FLOOR) if raw not in (None, "") else IDLE_COMPACT_TOKENS
+    except (TypeError, ValueError):
+        at = IDLE_COMPACT_TOKENS
+    _IDLE_CACHE[:] = [now, at if on else None]
+    return _IDLE_CACHE[1]
+
+
+def compacted_when_idle(size: int) -> bool:
+    at = idle_compact_at()
+    return at is not None and size >= at
 
 
 def closed_by_user(path) -> bool:
@@ -470,6 +512,7 @@ def remember(session: str | None, path: str, sent: bytes | None, headers: dict, 
         on, _ = enabled()
         p = pricing.price_for(model or "")
         why = (None if on else "off") or (None if big else "not big") or (
+        "Claude Code compacts it when idle" if compacted_when_idle(size) else None) or (
             None if p and size * (p.write_1h - p.read) / 1e6 >= MIN_SAVING_USD else "too small") or \
             eligible(path, sent, headers, usage, model, rate_limits)
         if why:

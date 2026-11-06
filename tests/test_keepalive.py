@@ -53,6 +53,10 @@ class Base(unittest.TestCase):
         ka._STARTED[0] = True                     # no background loop in tests
         ka.UPSTREAM[0] = "https://api.anthropic.com"
         self.rec = mock.patch.object(ka.vault, "record").start()
+        # As on a machine with Claude Code's idle compaction off: these tests are about
+        # other rules and use sessions above its 200K threshold (IdleCompactionTest covers it).
+        self.idle = mock.patch.object(ka, "idle_compact_at", return_value=None)
+        self.idle.start()
 
     def tearDown(self):
         mock.patch.stopall()
@@ -311,6 +315,51 @@ class BumpTest(Base):
             self.due_session(f"p{i}")
         self.tick()
         self.assertEqual(len(Stub.seen), 6)
+
+
+class IdleCompactionTest(Base):
+    """Claude Code compacts an idle session of 200K+ tokens about 55 minutes into a break,
+    just before a 58-minute bump: such a session is not held."""
+
+    def settings(self, data):
+        from tokensaver import claude_settings as cs
+        cs.SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        cs.SETTINGS.write_text(json.dumps(data))
+        ka._IDLE_CACHE[:] = [0.0, None]
+
+    def setUp(self):
+        super().setUp()
+        self.idle.stop()
+        mock.patch.object(ka.os, "environ", {}).start()
+        mock.patch("tokensaver.claude_settings.managed_paths", return_value=[]).start()
+        self.settings({})
+
+    def test_default_threshold(self):
+        self.assertEqual(ka.idle_compact_at(), 200_000)
+        self.on()
+        self.remember(usage={"cache_read_input_tokens": 250_000})
+        self.assertNotIn("s", ka._SESSIONS, "Claude Code compacts it at 55 minutes")
+        self.remember("small", usage={"cache_read_input_tokens": 160_000})
+        self.assertIn("small", ka._SESSIONS, "below the threshold: kept warm as before")
+
+    def test_turned_off_in_settings(self):
+        self.settings({"idleCompaction": False})
+        self.assertIsNone(ka.idle_compact_at())
+        self.on()
+        self.remember(usage={"cache_read_input_tokens": 250_000})
+        self.assertIn("s", ka._SESSIONS)
+
+    def test_threshold_from_the_settings_env_never_below_the_floor(self):
+        self.settings({"env": {"CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "300000"}})
+        self.assertEqual(ka.idle_compact_at(), 300_000)
+        self.settings({"env": {"CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "5000"}})
+        self.assertEqual(ka.idle_compact_at(), 100_000)
+        self.settings({"env": {"CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "lots"}})
+        self.assertEqual(ka.idle_compact_at(), 200_000)
+
+    def test_replay_skips_the_same_sessions(self):
+        self.assertEqual(ka.replay_bumps(0.0, 2 * H, True, {}, size=250_000), (0, False))
+        self.assertGreater(ka.replay_bumps(0.0, 2 * H, True, {}, size=160_000)[0], 0)
 
 
 class SettleTest(Base):
