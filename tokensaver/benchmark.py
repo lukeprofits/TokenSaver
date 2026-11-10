@@ -856,6 +856,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4),
             "write_5m_tokens": sum(r.write_5m for r in reqs), "write_1h_tokens": sum(r.write_1h for r in reqs),
             "through_tokensaver": through,
+            **({"live": live_facts(d.session.path.stem)} if through else {}),
             # what was billed, priced by the same cache model as plain (so the two compare fairly)
             **({"floor_tokens": floor_now(),
                 "billed_model_cost": round(price([r.context for r in reqs], set()), 4)} if through else {})}
@@ -916,6 +917,125 @@ def reliability(rows: list[dict], count) -> list[str]:
     out += ["    What to do: `tokensaver update`, then run the benchmark again. If this warning stays,",
             "    please send the saved result file: it lists the shape of each refused request (block",
             "    types only, no text from your sessions), which is what is needed to fix it."]
+    return out
+
+
+def commit() -> str | None:
+    """The checkout's commit (read from .git, no git command), so a result file says which
+    TokenSaver made it."""
+    try:
+        git = Path(__file__).resolve().parent.parent / ".git"
+        head = (git / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            ref = git / head[5:]
+            if ref.exists():
+                return ref.read_text().strip()[:12]
+            for line in (git / "packed-refs").read_text().splitlines():
+                if line.endswith(" " + head[5:]):
+                    return line.split()[0][:12]
+            return None
+        return head[:12]
+    except OSError:
+        return None
+
+
+def live_facts(session_id: str) -> dict:
+    """What the live proxy recorded for one session (this machine's vault; counts and reasons
+    only), so an "as it ran" figure that differs from the replay explains itself: which code
+    ran, whether it rewrote, which compactions it prepared, applied or dropped and why, whether
+    it fell back to plain relay, and the free token counts it made of the original against
+    what it sent."""
+    import collections
+    import sqlite3
+    from . import vault
+    out: dict = {"requests": 0, "rewritten": 0, "errors": 0, "fallback": 0, "applied": 0,
+                 "skipped": {}, "prepared": 0, "dropped_pending": 0, "fallback_events": 0,
+                 "bumps": 0, "codes": [], "first": None, "last": None,
+                 "audit_original": 0, "audit_sent": 0, "audited": 0}
+    if not session_id or not vault.DB_PATH.exists():
+        return out
+    skipped: collections.Counter = collections.Counter()
+    codes: dict = {}
+    try:
+        conn = sqlite3.connect(vault.DB_PATH)
+        rows = conn.execute("SELECT id, kind, ts FROM events WHERE session_id = ? AND kind IN "
+                            "('api_request', 'token_audit', 'bg_compaction_prepared', 'bg_dropped_pending', "
+                            "'rewrite_fallback', 'cache_bump') ORDER BY id", (session_id,)).fetchall()
+        conn.close()
+    except Exception:
+        return out
+    counted = {"bg_compaction_prepared": "prepared", "bg_dropped_pending": "dropped_pending",
+               "rewrite_fallback": "fallback_events", "cache_bump": "bumps"}
+    for rid, kind, ts in rows:
+        if kind in counted:
+            out[counted[kind]] += 1
+            continue
+        try:
+            m = vault.read_meta(rid)
+        except Exception:
+            continue
+        if kind == "token_audit":
+            if m.get("tokens_original") and m.get("tokens_sent"):
+                out["audit_original"] += int(m["tokens_original"])
+                out["audit_sent"] += int(m["tokens_sent"])
+                out["audited"] += 1
+            continue
+        if kind != "api_request" or m.get("request_class") not in ("main", None) \
+                or str(m.get("path") or "").split("?")[0] != "/v1/messages":
+            continue
+        rw = m.get("rewrite") or {}
+        out["requests"] += 1
+        out["first"] = out["first"] or ts
+        out["last"] = ts
+        code = m.get("code") or "unrecorded"
+        codes[code] = codes.get(code, 0) + 1
+        if rw.get("bytes_out") and rw.get("bytes_in") and rw["bytes_out"] < rw["bytes_in"]:
+            out["rewritten"] += 1
+        out["errors"] += bool(rw.get("error"))
+        out["fallback"] += bool(rw.get("fallback"))
+        out["applied"] += bool(rw.get("bg_applied"))
+        if rw.get("bg_skipped"):
+            skipped[str(rw["bg_skipped"])[:80]] += 1
+    out["skipped"] = dict(skipped.most_common(5))
+    out["codes"] = sorted(codes.items(), key=lambda kv: -kv[1])
+    return out
+
+
+def live_line(rows: list[dict]) -> list[str]:
+    """Why "as it ran" differs from the replay, from what the live proxy recorded."""
+    ts = [r for r in rows if r.get("through_tokensaver") and r.get("live")]
+    if not ts:
+        return []
+    L = [r["live"] for r in ts]
+    tot = lambda k: sum(x.get(k) or 0 for x in L)
+    seen = tot("requests")
+    if not seen:
+        return [" as it ran: this machine's vault has no record of those sessions' requests "
+                "(older than its retention, or recorded under another session id)"]
+    replay_applied = sum(r.get("compactions") or 0 for r in ts)
+    codes: dict = {}
+    for x in L:
+        for c, n in x.get("codes") or []:
+            codes[c] = codes.get(c, 0) + n
+    skipped: dict = {}
+    for x in L:
+        for why, n in (x.get("skipped") or {}).items():
+            skipped[why] = skipped.get(why, 0) + n
+    first = min(x["first"] for x in L if x.get("first"))
+    last = max(x["last"] for x in L if x.get("last"))
+    out = [f" as it ran ({first[:10]} to {last[:10]}, {seen:,} requests the proxy saw): "
+           f"{tot('rewritten'):,} rewritten, {tot('applied')} compactions applied live vs {replay_applied} "
+           f"in today's replay; {tot('prepared')} prepared, {tot('dropped_pending')} dropped as stale; "
+           f"{tot('fallback')} sent plain after a fallback ({tot('fallback_events')} fallback events), "
+           f"{tot('errors')} rewrite errors; {tot('bumps')} keep-alive bumps"]
+    if tot("audited"):
+        out.append(f"   live token counts on {tot('audited'):,} requests: {tot('audit_original'):,} original -> "
+                   f"{tot('audit_sent'):,} sent ({_pct(tot('audit_sent'), tot('audit_original')):.1f}% fewer)")
+    if skipped:
+        out.append("   compactions not applied live: "
+                   + "; ".join(f"{why} x{n}" for why, n in sorted(skipped.items(), key=lambda kv: -kv[1])[:3]))
+    out.append("   proxy code: " + ", ".join(f"{c} x{n}" for c, n in
+                                             sorted(codes.items(), key=lambda kv: -kv[1])[:4]))
     return out
 
 
@@ -1166,6 +1286,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
     lines += [f" cost model check (sessions without TokenSaver): plain modelled ${pc:,.2f} vs your real bill ${rc:,.2f}",
               cache_lifetime_line(ok, ttl_decision, main_ttl),
               measured_line(ok),
+              *live_line(ok),
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
                  if count.errors else "")
@@ -1187,7 +1308,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
     lines += reliability(ok, count)
     lines += rate_limit_warning(count)
     print("\n".join(lines))
-    report = {"tokensaver": __version__, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": step, "mode": mode,
+    report = {"tokensaver": __version__, "commit": commit(), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": step, "mode": mode,
               "settings": {"bg_after_min": after_s / 60, "bg_warm_payback_max": payback},
               "cache_ttl": {"main_ttl": main_ttl, **ttl_decision},
               "thinking_factors": factors,

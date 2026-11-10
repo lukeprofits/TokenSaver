@@ -217,7 +217,7 @@ class ChooseTest(unittest.TestCase):
         self.assertLess(d["cost_5m"], d["cost_1h"])
 
     def test_pauses_on_big_contexts_set_1h(self):
-        d = self.choose(6, 15, 20, 200_000)
+        d = self.choose(6, 15, 20, 200_000, ttl="1h")         # as run on 1h: the reads are real
         self.assertTrue(d["set"], d["why"])
         self.assertLess(d["cost_1h"], d["cost_5m"])
 
@@ -225,6 +225,12 @@ class ChooseTest(unittest.TestCase):
         d = self.choose(2, 15, 1, 50_000)
         self.assertTrue(d["set"])
         self.assertIn("only 2 sessions", d["why"])
+
+    def test_an_unreliable_model_falls_back_to_the_default(self):
+        # 20-minute pauses that still read a 5-minute cache: impossible, so the model is no guide here
+        d = self.choose(6, 15, 20, 200_000, ttl="5m")
+        self.assertTrue(d["thin"] and d["set"], d)
+        self.assertIn("cache model", d["why"])
 
     def test_model_accuracy_against_real_reads(self):
         root = Path(tempfile.mkdtemp())
@@ -279,13 +285,37 @@ class SettingTest(unittest.TestCase):
         self.write({})
         cachettl.apply(self.decision, backup=False)
         now = [2_000_000_000.0]
-        cheap5 = {"set": False, "cost_1h": 100.0, "cost_5m": 85.0, "sessions": 9, "accuracy": 1.0, "why": "x"}
-        close = dict(cheap5, cost_5m=95.0)
+        cheap5 = {"set": False, "cost_1h": 100.0, "cost_5m": 85.0, "sessions": 9, "accuracy": 0.99,
+                  "margin": 0.01, "switch_1h": 1.0, "switch_5m": 1.0, "thin": False, "why": "x"}
+        close = dict(cheap5, cost_5m=99.5)                  # inside the model's 1% margin
         for d, removed in ((close, False), (cheap5, False), (close, False), (cheap5, False), (cheap5, True)):
             now[0] += cachettl.RECHECK_S + 1
             with mock.patch.object(cachettl, "choose", lambda **k: d):
                 cachettl.recheck(now=now[0])
             self.assertEqual("promptCacheTtl" not in self.read(), removed, (d, removed))
+
+    def test_a_small_saving_does_not_pay_for_the_switch(self):
+        d = {"cost_1h": 100.0, "cost_5m": 98.0, "margin": 0.01, "switch_5m": 1.0}
+        self.assertFalse(cachettl.worth_switching(d, "5m"), "2% is past the margin, but a week of it "
+                                                           "($0.47) does not pay one rewrite ($1)")
+        self.assertTrue(cachettl.worth_switching(dict(d, cost_5m=80.0), "5m"))
+        self.assertFalse(cachettl.worth_switching(dict(d, cost_5m=95.0, margin=0.10), "5m"),
+                         "a model that misses 10% of reads needs a 10% margin")
+
+    def test_margin_follows_the_models_accuracy(self):
+        self.assertEqual(cachettl.margin(0.996), cachettl.MIN_MARGIN)
+        self.assertAlmostEqual(cachettl.margin(0.85), 0.15)
+        self.assertEqual(cachettl.margin(None), 0.10)
+
+    def test_thin_history_is_rechecked_daily(self):
+        self.write({})
+        thin = {"set": True, "cost_1h": 1.0, "cost_5m": 1.0, "sessions": 1, "accuracy": None, "margin": 0.1,
+                "switch_1h": 0.0, "switch_5m": 0.0, "thin": True, "why": "thin"}
+        cachettl.save_state({"decision": thin, "checked_at": 1_000_000.0})
+        calls = []
+        with mock.patch.object(cachettl, "choose", lambda **k: calls.append(1) or thin):
+            cachettl.recheck(now=1_000_000.0 + 86400 + 1)
+        self.assertEqual(len(calls), 1, "a day later, not a week")
 
     def test_off_sticks(self):
         self.write({})
@@ -316,6 +346,35 @@ class BenchmarkMainTtlTest(unittest.TestCase):
         d = _session("5m", {15: 90})
         on = benchmark.replay(d, COUNT, 8, 900, 70, 0.264, keepalive_ends=_ends(), main_ttl="1h")
         self.assertGreater(on["keepalive_bumps"], 0, "with 1h set, keep-alive runs on this session")
+
+
+class LiveFactsTest(unittest.TestCase):
+    """A TokenSaver session's "as it ran" explains itself from what the proxy recorded."""
+
+    def test_counts_from_the_vault(self):
+        from tokensaver import vault
+        sid = "live-facts-test-session"
+        main = {"path": "/v1/messages", "request_class": "main", "code": "abc"}
+        vault.record("api_request", content="{}", tool="proxy", session_id=sid, summary="r",
+                     meta=dict(main, rewrite={"bytes_in": 100, "bytes_out": 90, "bg_applied": True}), index=False)
+        vault.record("api_request", content="{}", tool="proxy", session_id=sid, summary="r",
+                     meta=dict(main, rewrite={"bytes_in": 100, "bytes_out": 100,
+                                              "bg_skipped": "payback 80 > 70 requests"}), index=False)
+        vault.record("api_request", content="{}", tool="proxy", session_id=sid, summary="r",
+                     meta=dict(main, rewrite={"fallback": "session"}), index=False)
+        vault.record("bg_dropped_pending", tool="proxy", session_id=sid, summary="d", meta={}, index=False)
+        vault.record("token_audit", tool="proxy", session_id=sid, summary="a",
+                     meta={"tokens_original": 1000, "tokens_sent": 900}, index=False)
+        f = benchmark.live_facts(sid)
+        self.assertEqual((f["requests"], f["rewritten"], f["applied"], f["fallback"], f["dropped_pending"]),
+                         (3, 1, 1, 1, 1))
+        self.assertEqual(f["skipped"], {"payback 80 > 70 requests": 1})
+        self.assertEqual((f["audit_original"], f["audit_sent"]), (1000, 900))
+        self.assertEqual(f["codes"], [("abc", 3)])
+        lines = benchmark.live_line([{"through_tokensaver": True, "live": f, "compactions": 2}])
+        self.assertIn("1 compactions applied live vs 2 in today's replay", lines[0])
+        self.assertTrue(any("10.0% fewer" in x for x in lines))
+        self.assertEqual(benchmark.live_facts("no-such-session")["requests"], 0)
 
 
 if __name__ == "__main__":

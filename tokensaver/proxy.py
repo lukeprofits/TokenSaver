@@ -2254,6 +2254,7 @@ class Handler(BaseHTTPRequestHandler):
             "prompt_id": self.headers.get("x-claude-code-prompt-id"),
             "headers": headers,
             "rewrite": getattr(self, "_rewrite_stats", {}),
+            "code": _CODE_ID,     # which code ran it (the benchmark explains "as it ran" with it)
         }
         if dropped:
             meta["input_transformations"] = dropped[:20]

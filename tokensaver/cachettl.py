@@ -96,9 +96,9 @@ def write_price(p, ttl: str | None) -> float:
 WINDOW_DAYS = 30
 MIN_SESSIONS = 5            # with MIN_REQUESTS or more; fewer: the user's default, 1h
 MIN_REQUESTS = 10
-SET_MARGIN = 0.02           # setup sets 1h when it is at least this much cheaper
-FLIP_BAND = 0.10            # the weekly re-check changes ours only past this, twice running
-RECHECK_S = 7 * 86400
+MIN_MARGIN = 0.01           # the smallest margin a choice must win by (see `margin`)
+RECHECK_S = 7 * 86400       # with enough history
+RECHECK_THIN_S = 86400      # until then: daily, so the default gives way to measurement soon
 MIN_VERSION = (2, 1, 242)   # Claude Code that knows `promptCacheTtl`
 KEY = "promptCacheTtl"
 
@@ -131,32 +131,66 @@ def hit_accuracy(reqs) -> tuple[int, int]:
     return right, n
 
 
+def margin(accuracy: float | None) -> float:
+    """How much cheaper a choice must be before it counts: the share of cache reads the
+    model got wrong on this user's own history (at least MIN_MARGIN). A model that predicts
+    99% of real reads needs 1%; one that misses 15% needs 15%."""
+    return max(MIN_MARGIN, 1 - accuracy) if accuracy is not None else 0.10
+
+
+MIN_ACCURACY = 0.8          # below this the model is no guide: treated as too little history
+
+
 def choose(root=None, now: float | None = None) -> dict:
-    """{"set": bool, "cost_1h", "cost_5m", "sessions", "accuracy", "why"}: local, free."""
+    """{"set": bool, "cost_1h", "cost_5m", "sessions", "accuracy", "margin", "switch_1h",
+    "switch_5m", "thin", "why"}: local, free. `switch_<ttl>`: what one change to that
+    lifetime costs a typical open session (its cache written once more)."""
     import time
     from . import sim
     now = time.time() if now is None else now
     kw = {"root": root} if root is not None else {}
-    c1 = c5 = 0.0
-    used = right = of = 0
+    c1 = c5 = sw1 = sw5 = 0.0
+    used = n = right = of = 0
     for d in sim.sessions(include_rewritten=True, **kw):
         rq = d.requests
         if not rq or now - sim._ts(rq[-1].timestamp) > WINDOW_DAYS * 86400:
             continue
         c1 += price_history(rq, d.price, "1h")
         c5 += price_history(rq, d.price, "5m")
+        last = rq[-1].context
+        sw1 += last * (d.price.write_1h - d.price.read) / 1e6
+        sw5 += last * (d.price.write_5m - d.price.read) / 1e6
+        n += 1
         used += len(rq) >= MIN_REQUESTS
         a, b = hit_accuracy(rq)
         right, of = right + a, of + b
-    out = {"cost_1h": round(c1, 2), "cost_5m": round(c5, 2), "sessions": used,
-           "accuracy": round(right / of, 3) if of else None}
-    if used < MIN_SESSIONS:
+    acc = round(right / of, 3) if of else None
+    m = margin(acc)
+    out = {"cost_1h": round(c1, 2), "cost_5m": round(c5, 2), "sessions": used, "accuracy": acc,
+           "margin": round(m, 3), "switch_1h": round(sw1 / n, 2) if n else 0.0,
+           "switch_5m": round(sw5 / n, 2) if n else 0.0,
+           "thin": used < MIN_SESSIONS or (acc is not None and acc < MIN_ACCURACY)}
+    if out["thin"] and used >= MIN_SESSIONS:
+        return dict(out, set=True, why=f"the cache model predicted only {100 * acc:.0f}% of your real cache "
+                                         f"reads, too few to decide on: the default, 1 hour (checked daily)")
+    if out["thin"]:
         return dict(out, set=True, why=f"only {used} sessions of {MIN_REQUESTS}+ requests in "
-                                         f"{WINDOW_DAYS} days: the default, 1 hour")
-    if c1 <= (1 - SET_MARGIN) * c5:
+                                         f"{WINDOW_DAYS} days: the default, 1 hour (checked daily until there are "
+                                         f"{MIN_SESSIONS})")
+    if c1 <= (1 - m) * c5:
         return dict(out, set=True, why=f"1 hour ${c1:,.2f} vs 5 minutes ${c5:,.2f} on your last {WINDOW_DAYS} days")
-    return dict(out, set=False, why=f"5 minutes is as cheap or cheaper (${c5:,.2f} vs ${c1:,.2f} with "
-                                    f"1 hour): Claude Code's own choice stands")
+    return dict(out, set=False, why=f"1 hour is not clearly cheaper (${c1:,.2f} vs ${c5:,.2f} with 5 minutes, "
+                                    f"margin {100 * m:.0f}%): Claude Code's own choice stands")
+
+
+def worth_switching(d: dict, to: str) -> bool:
+    """The other lifetime is cheaper by the model's margin AND a week of that saving pays
+    for the switch itself (every open session writes its cache once more)."""
+    cur, new = (d["cost_5m"], d["cost_1h"]) if to == "1h" else (d["cost_1h"], d["cost_5m"])
+    if new > (1 - d.get("margin", 0.10)) * cur:
+        return False
+    weekly = (cur - new) * 7 / WINDOW_DAYS
+    return weekly > d.get("switch_" + to, 0.0)
 
 
 # ---- the setting ------------------------------------------------------------------------
@@ -243,13 +277,14 @@ def claude_version() -> tuple[int, ...] | None:
 
 
 def recheck(now: float | None = None) -> str | None:
-    """Weekly, from the watchdog: change our own value only when the other choice has been
-    FLIP_BAND cheaper on two checks running. Never touches a user's value or runs while the
-    user turned it off; the first check only records. Returns what it did."""
+    """From the watchdog: daily while the history is thin, weekly after. Changes our own value
+    only when `worth_switching` holds on two checks running. Never touches a user's value or
+    runs while the user turned it off; the first check only records. Returns what it did."""
     import time
     now = time.time() if now is None else now
     st = load_state()
-    if st.get("mode") == "off" or now - float(st.get("checked_at") or 0) < RECHECK_S:
+    every = RECHECK_THIN_S if (st.get("decision") or {}).get("thin", True) else RECHECK_S
+    if st.get("mode") == "off" or now - float(st.get("checked_at") or 0) < every:
         return None
     v, ours = current()
     if v is not None and not ours:
@@ -259,24 +294,20 @@ def recheck(now: float | None = None) -> str | None:
     st = load_state()
     st.update(checked_at=now, decision=d)
     if ours:
-        want_off = st.get("mode") != "on" and d["cost_5m"] <= (1 - FLIP_BAND) * d["cost_1h"] \
-            and d["sessions"] >= MIN_SESSIONS
-        st["streak"] = int(st.get("streak") or 0) + 1 if want_off else 0
-        save_state(st)
-        if st["streak"] >= 2:
-            msg = remove(backup=False)
-            st = dict(load_state(), streak=0, decision=d, auto_removed=now)
-            save_state(st)
-            return msg
-        return None
-    want_on = d["cost_1h"] <= (1 - FLIP_BAND) * d["cost_5m"]
-    st["streak"] = int(st.get("streak") or 0) + 1 if want_on else 0
+        want = st.get("mode") != "on" and not d["thin"] and worth_switching(d, "5m")
+    else:
+        want = worth_switching(d, "1h") or (d["thin"] and st.get("mode") != "off")
+    st["streak"] = int(st.get("streak") or 0) + 1 if want else 0
     save_state(st)
-    if st["streak"] >= 2:
+    if st["streak"] < 2:
+        return None
+    if ours:
+        msg = remove(backup=False)
+        save_state(dict(load_state(), streak=0, decision=d, auto_removed=now))
+    else:
         msg = apply(d, backup=False)
         save_state(dict(load_state(), streak=0))
-        return msg
-    return None
+    return msg
 
 
 def set_mode(mode: str) -> str:
