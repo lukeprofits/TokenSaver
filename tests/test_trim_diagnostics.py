@@ -94,6 +94,27 @@ class ReplayTrimsTest(unittest.TestCase):
                 self.assertGreater(t["value"], 0, "free on an expired cache")
 
 
+class CostSplitTest(unittest.TestCase):
+    def test_billed_and_modelled_tokens(self):
+        with mock.patch("tokensaver.keepalive.idle_compact_at", return_value=None):
+            r = benchmark.replay(_session({30: 20}), COUNT, 8, 900, 70, 0.264)
+        n = r["requests"]
+        self.assertEqual(r["real_tokens"], {"input": 2 * n, "read": 200_000 * n, "write_5m": 0,
+                                            "write_1h": 100 * n, "output": 10 * n})
+        m = r["model_tokens"]
+        self.assertEqual(m["read"] + m["write"], (2 + 200_000 + 100) * n, "every billed token, split")
+        self.assertGreater(m["read"], m["write"])
+
+    def test_line(self):
+        rows = [{"real_tokens": {"input": 3_000_000, "read": 90_000_000, "write_1h": 5_000_000, "write_5m": 0,
+                                 "output": 1_000_000},
+                 "model_tokens": {"read": 88_000_000, "write": 10_000_000}}]
+        self.assertEqual(benchmark.cost_split_line(rows),
+                         ["   billed: 90.0M read, 5.0M written, 3.0M uncached input, 1.0M output; "
+                          "modelled: 88.0M read, 10.0M written"])
+        self.assertEqual(benchmark.cost_split_line([{}]), [])
+
+
 class TrimsLinesTest(unittest.TestCase):
     def row(self, *trims, no_trim=None):
         return {"trims": list(trims), "no_trim": no_trim or {}}

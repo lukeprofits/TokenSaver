@@ -907,12 +907,15 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         if n:
             bump_events.append((last, n))
 
-    def price(sizes, rebuilt, warm=frozenset(), bumps=(), t=ttls) -> float:
+    def price(sizes, rebuilt, warm=frozenset(), bumps=(), t=ttls, parts=None) -> float:
         cost, prev = 0.0, None
         for k, (r, size, p) in enumerate(zip(reqs, sizes, prices)):
             gap = sim._ts(r.timestamp) - sim._ts(reqs[k - 1].timestamp) if k else 0
             hit = 0 if prev is None or (expired(k, gap, t) and k not in warm) or k in rebuilt else min(prev, size)
             cost += (hit * p.read + (size - hit) * cachettl.write_price(p, t[k]) + r.out * p.out) / 1e6
+            if parts is not None:              # the model's token split, to set beside the real one
+                parts["read"] = parts.get("read", 0) + hit
+                parts["write"] = parts.get("write", 0) + size - hit
             prev = size
         # a bump reads the context its session had then
         return cost + sum(n * sizes[i] * prices[i].read / 1e6 for i, n in bumps)
@@ -938,6 +941,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     # What the kept-warm returns would otherwise have paid: the cached part written again.
     kept_saved = sum(min(ours[k - 1], ours[k]) * (prices[k].write_1h - prices[k].read) / 1e6
                      for k in kept_warm if k not in rebuilt)
+    model_parts: dict[str, int] = {}
+    price([r.context for r in reqs], set(), parts=model_parts)      # what was billed, as modelled
     return {"requests": len(reqs), "model": model, "breaks": breaks, "counted": len(removed_at),
             "decisions": decisions, "compactions": len(applied_at), "count_failures": failed,
             "trims": [{"cold": r["cold"], "applied": r["applied"], "reps": round(r["reps"], 1),
@@ -957,6 +962,12 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             "keepalive_bumps": sum(n for _, n in bump_events), "keepalive_kept": len(kept_warm),
             "keepalive_cost": round(bump_cost, 4), "keepalive_saved": round(kept_saved, 4),
             "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4),
+            # What was really billed, by kind, and the cache model's split of the same requests:
+            # where the cost model check's gap comes from (tokens only).
+            "real_tokens": {"input": sum(r.inp for r in reqs), "read": sum(r.read for r in reqs),
+                            "write_5m": sum(r.write_5m for r in reqs),
+                            "write_1h": sum(r.write - r.write_5m for r in reqs), "output": sum(r.out for r in reqs)},
+            "model_tokens": model_parts,
             "write_5m_tokens": sum(r.write_5m for r in reqs), "write_1h_tokens": sum(r.write_1h for r in reqs),
             "through_tokensaver": through,
             **({"live": live_facts(d.session.path.stem)} if through else {}),
@@ -1188,6 +1199,25 @@ def keepalive_line(rows: list[dict], ends) -> str:
     saved = sum(r.get("keepalive_saved", 0) for r in rows)
     return (f" cache keep-alive (included above): {bumps} bumps kept {kept} breaks warm; "
             f"spent ${cost:,.2f}, saved ~${saved:,.2f} in rewrites")
+
+
+def cost_split_line(rows: list[dict]) -> list[str]:
+    """The billed tokens by kind next to the cache model's split of the same requests, so a
+    gap in the cost model check shows where it is (e.g. new tokens billed as plain input,
+    which the model prices as cache writes)."""
+    real: dict[str, int] = {}
+    model: dict[str, int] = {}
+    for r in rows:
+        for k, v in (r.get("real_tokens") or {}).items():
+            real[k] = real.get(k, 0) + v
+        for k, v in (r.get("model_tokens") or {}).items():
+            model[k] = model.get(k, 0) + v
+    if not real or not model:
+        return []
+    m = lambda n: f"{n / 1e6:,.1f}M"
+    return [f"   billed: {m(real.get('read', 0))} read, {m(real.get('write_1h', 0) + real.get('write_5m', 0))} written, "
+            f"{m(real.get('input', 0))} uncached input, {m(real.get('output', 0))} output; "
+            f"modelled: {m(model.get('read', 0))} read, {m(model.get('write', 0))} written"]
 
 
 LIMITS = (20, 33, 49, 70, 100, 150, 200)
@@ -1445,6 +1475,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
                     "without local AI: `--benchmark full` includes it):")]
     lines += summarize(rows)
     lines += [f" cost model check (sessions without TokenSaver): plain modelled ${pc:,.2f} vs your real bill ${rc:,.2f}",
+              *cost_split_line(plainside),
               cache_lifetime_line(ok, ttl_decision, main_ttl),
               measured_line(ok),
               *live_line(ok),
