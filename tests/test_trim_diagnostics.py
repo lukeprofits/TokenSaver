@@ -146,5 +146,71 @@ class TrimsLinesTest(unittest.TestCase):
         self.assertEqual(benchmark.trims_lines([{"trims": [], "no_trim": {}}], 70), [])
 
 
+class PredictionTest(unittest.TestCase):
+    """Cache reads predicted from reply times and from request times."""
+
+    def reqs(self, rows):
+        stamp = lambda s: _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(1_800_000_000 + s))
+        return [NS(timestamp=stamp(end), start=stamp(start) if start is not None else "", read=read,
+                   context=100_000, write_5m=w5, write_1h=0) for start, end, read, w5 in rows]
+
+    def test_request_times_fix_a_long_reply_at_the_edge(self):
+        # A 5-minute cache. Request 2 starts 4 min after request 1 started (a hit), but its reply
+        # took almost 3 minutes: reply times say 5 min 40 s (a miss).
+        rq = self.reqs([(0, 60, 0, 100_000), (240, 400, 99_000, 1_000)])
+        p = __import__("tokensaver.cachettl", fromlist=["x"]).prediction(rq)
+        self.assertEqual(p["reply"], [0, 1])
+        self.assertEqual(p["request"], [1, 1])
+        self.assertEqual((p["edge_reply"], p["edge_request"]), ([0, 1], [1, 1]))
+
+    def test_missing_start_falls_back_to_reply_time(self):
+        rq = self.reqs([(None, 60, 0, 100_000), (None, 120, 99_000, 1_000)])
+        from tokensaver import cachettl
+        p = cachettl.prediction(rq)
+        self.assertEqual((p["reply"], p["request"]), ([1, 1], [1, 1]))
+
+    def test_line(self):
+        rows = [{"prediction": {"reply": [9, 10], "request": [10, 10], "edge_reply": [1, 2], "edge_request": [2, 2]}}]
+        self.assertEqual(benchmark.prediction_line(rows),
+                         ["   cache reads predicted: from reply times 90.0%, from request times 100.0%; "
+                          "near the cache's expiry (2 gaps): 50.0% vs 100.0%"])
+
+    def test_transcript_start_times(self):
+        from tokensaver import transcripts
+        d = _session({})
+        reqs = [e[1] for e in transcripts.api_history(d.session.path)[1]]
+        self.assertTrue(all(r.start and r.start <= r.timestamp for r in reqs))
+        self.assertEqual([r.start for r in transcripts.read_session(d.session.path).requests],
+                         [r.start for r in reqs], "both loaders agree")
+
+
+class MachineStateTest(unittest.TestCase):
+    def test_no_proxy_and_lines(self):
+        with mock.patch("tokensaver.service.health", return_value=None):
+            st = benchmark.machine_state()
+        self.assertIsNone(st["proxy"])
+        self.assertIn("bill", st)
+        self.assertEqual(benchmark.machine_line(st)[0], " TokenSaver here: proxy not answering")
+        blob = json.dumps(st)
+        self.assertNotIn("http", blob, "no URLs in a shared file")
+
+    def test_running_proxy_line(self):
+        st = {"proxy": {"code": "a", "code_on_disk": "b", "audit": {"on": False, "disabled": "401 from count_tokens"},
+                        "fallback": False},
+              "bill": {"last_7_days": {"real": 90.0, "plain": 100.0, "requests": 10},
+                       "all": {"real": 0, "plain": 0, "requests": 0}}}
+        lines = benchmark.machine_line(st)
+        self.assertEqual(lines[0], " TokenSaver here: proxy code a (older than the code on disk: restart), "
+                                   "audit off (401 from count_tokens), fallback off")
+        self.assertEqual(lines[1], "   live bill: last 7 days $90.00 vs $100.00 plain (10.0% saved, 10 requests)")
+
+    def test_cost_by_model(self):
+        rows = [{"model": "claude-opus-5-5", "plain_cost": 10.0, "real_cost": 9.0},
+                {"model": "claude-sonnet-5-5", "plain_cost": 2.0, "real_cost": 2.0}]
+        self.assertEqual(benchmark.cost_by_model_line(rows),
+                         ["   by model: opus 5.5 $10.00 vs $9.00 (1), sonnet 5.5 $2.00 vs $2.00 (1)"])
+        self.assertEqual(benchmark.cost_by_model_line(rows[:1]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

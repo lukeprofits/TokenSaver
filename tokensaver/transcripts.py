@@ -29,6 +29,10 @@ class Request:
     out: int
     timestamp: str
     effort: str | None = None
+    # When the request was sent, as near as the transcript tells: the time of the user or
+    # tool-result record just before the reply ("" if none). `timestamp` is when the reply
+    # was written; a cache entry's lifetime runs from the request.
+    start: str = ""
 
     @property
     def context(self) -> int:
@@ -106,6 +110,7 @@ def read_session(path: Path) -> Session:
     # once per message id. Measured: 10,895 records were 5,185 requests, so
     # every figure from transcripts was inflated about 2x.
     seen_ids: set[str] = set()
+    last_user = ""
     with path.open(errors="replace") as fh:
         for line in fh:
             line = line.strip()
@@ -141,6 +146,8 @@ def read_session(path: Path) -> Session:
 
             u = _usage(rec)
             if not u:
+                if rec.get("type") == "user" and rec.get("timestamp"):
+                    last_user = rec["timestamp"]
                 continue
             mid = (rec.get("message") or {}).get("id")
             if mid:
@@ -158,6 +165,7 @@ def read_session(path: Path) -> Session:
                 out=_int(u, "output_tokens"),
                 timestamp=rec.get("timestamp", ""),
                 effort=rec.get("effort"),
+                start=last_user,
             )
             # Records with no tokens at all are bookkeeping, not billed requests.
             if req.context or req.out:
@@ -204,6 +212,7 @@ def api_history(path: Path, info: dict | None = None) -> tuple[list[dict], list[
     results: set = set()
     dup = 0
     bounds: list = []
+    last_user = ""
     if info is not None:
         info["duplicates"], info["boundaries"] = 0, bounds
     try:
@@ -236,11 +245,14 @@ def api_history(path: Path, info: dict | None = None) -> tuple[list[dict], list[
                     continue
                 uuids.add(uid)
             mid = msg.get("id")
+            if role == "user" and rec.get("timestamp"):
+                last_user = rec["timestamp"]
             if role == "assistant" and mid and mid not in seen:
                 seen.add(mid)
                 u = _usage(rec)
                 if u:
                     req = _request(rec, u)
+                    req.start = last_user
                     if req.context or req.out:
                         requests.append((len(messages), req, start))
             items = content if isinstance(content, list) else [{"type": "text", "text": content}]

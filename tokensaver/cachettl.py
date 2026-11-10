@@ -152,6 +152,35 @@ def hit_accuracy(reqs) -> tuple[int, int]:
     return right, n
 
 
+def prediction(reqs) -> dict:
+    """How well a cache read is predicted from the gap, timed two ways: between replies
+    (`timestamp`, what the models use) and between requests (`start`, when the transcript
+    has it). {"reply": [right, of], "request": [...], "edge_reply": [...], "edge_request": [...]};
+    the edge is gaps near the lifetime (2 minutes under to 5 over), where the two can disagree.
+    A 5-minute cache is where it matters (one machine's model was 9% over its bill)."""
+    from . import sim
+    ttls = per_request(reqs)
+    out = {k: [0, 0] for k in ("reply", "request", "edge_reply", "edge_request")}
+    for k in range(1, len(reqs)):
+        a, b = reqs[k - 1], reqs[k]
+        life = seconds(ttls[k - 1])
+        end_a, end_b = sim._ts(a.timestamp), sim._ts(b.timestamp)
+        start = lambda r, end, floor: (sim._ts(r.start) if getattr(r, "start", "") and
+                                       floor <= sim._ts(r.start) <= end else end)
+        st_a = start(a, end_a, sim._ts(reqs[k - 2].timestamp) if k > 1 else 0)
+        st_b = start(b, end_b, end_a)
+        seen = b.read >= 0.5 * a.context
+        edge = life - 120 <= end_b - end_a <= life + 300
+        for kind, gap in (("reply", end_b - end_a), ("request", st_b - st_a)):
+            right = (gap <= life) == seen
+            out[kind][0] += right
+            out[kind][1] += 1
+            if edge:
+                out["edge_" + kind][0] += right
+                out["edge_" + kind][1] += 1
+    return out
+
+
 def margin(accuracy: float | None) -> float:
     """How much cheaper a choice must be before it counts: the share of cache reads the
     model got wrong on this user's own history (at least MIN_MARGIN). A model that predicts

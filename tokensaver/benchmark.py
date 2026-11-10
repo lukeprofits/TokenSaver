@@ -970,6 +970,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             "keepalive_bumps": sum(n for _, n in bump_events), "keepalive_kept": len(kept_warm),
             "keepalive_cost": round(bump_cost, 4), "keepalive_saved": round(kept_saved, 4),
             "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4),
+            "prediction": cachettl.prediction(reqs),       # cache reads predicted from reply / request times
             # What was really billed, by kind, and the cache model's split of the same requests:
             # where the cost model check's gap comes from (tokens only).
             "real_tokens": {"input": sum(r.inp for r in reqs), "read": sum(r.read for r in reqs),
@@ -1207,6 +1208,109 @@ def keepalive_line(rows: list[dict], ends) -> str:
     saved = sum(r.get("keepalive_saved", 0) for r in rows)
     return (f" cache keep-alive (included above): {bumps} bumps kept {kept} breaks warm; "
             f"spent ${cost:,.2f}, saved ~${saved:,.2f} in rewrites")
+
+
+STATE_SETTINGS = ("rewrite", "bg_compact", "audit", "local_ai", "cache_keepalive", "prune_tier",
+                  "bg_after_min", "bg_warm_payback_max", "bg_prep_idle_min")
+
+
+def machine_state() -> dict:
+    """What TokenSaver is doing on this machine right now, so a shared result file answers
+    what `tokensaver proxy --stats` would: the running proxy (code, audit and why it is off,
+    fallback), local AI, keep-alive, routing, settings and their sources, and the live bill
+    (all time and the last 7 days). Numbers, states and reasons only: no paths, URLs or text."""
+    from . import bill, keepalive, localai, proxy, routing, service
+    out: dict = {}
+
+    def safe(key, fn):
+        try:
+            out[key] = fn()
+        except Exception as exc:                 # one missing piece never stops the report
+            out[key] = f"unavailable ({type(exc).__name__})"
+
+    def health():
+        h = service.health(timeout=2.0)
+        if not h:
+            return None
+        a = h.get("audit") or {}
+        return {"ok": h.get("ok"), "rewrite": h.get("rewrite"), "bg_compact": h.get("bg_compact"),
+                "fallback": h.get("fallback"), "version": h.get("version"), "code": h.get("code"),
+                "code_on_disk": proxy.code_id(), "started": h.get("started"),
+                "audit": {k: a.get(k) for k in ("on", "disabled", "dropped", "calls_today")},
+                "thinking_rate": {m: (r or {}).get("value") for m, r in (h.get("thinking_rate") or {}).items()}}
+
+    def bills():
+        res = {}
+        week = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7 * 86400))
+        for label, since in (("all", ""), ("last_7_days", week)):
+            b = bill.compute(since=since)
+            ours = [m for m in b.misses if m.ours]
+            res[label] = {"requests": b.requests, "audited": b.audited, "real": round(b.real, 2),
+                          "plain": round(b.plain, 2), "rebuilds_charged": len(ours),
+                          "rebuilds_charged_cost": round(sum(m.dollars for m in ours), 2)}
+        return res
+
+    safe("proxy", health)
+    safe("local_ai", localai.describe)
+    safe("keepalive", keepalive.describe)
+    safe("routing", lambda: {k: routing.state().get(k) for k in ("managed", "on", "at")})
+    safe("settings", lambda: {k: list(config.resolve(k)) for k in STATE_SETTINGS if k in config.SPECS})
+    safe("bill", bills)
+    return out
+
+
+def machine_line(st: dict) -> list[str]:
+    """The machine state in two lines."""
+    p = st.get("proxy")
+    if not isinstance(p, dict):
+        head = " TokenSaver here: proxy not answering" if p is None else f" TokenSaver here: proxy {p}"
+    else:
+        a = p.get("audit") or {}
+        head = (f" TokenSaver here: proxy code {p.get('code')}"
+                + ("" if p.get("code") == p.get("code_on_disk") else " (older than the code on disk: restart)")
+                + f", audit {'on' if a.get('on') else 'off'}" + (f" ({a['disabled']})" if a.get("disabled") else "")
+                + f", fallback {'ON' if p.get('fallback') else 'off'}")
+    out = [head]
+    b = st.get("bill")
+    if isinstance(b, dict) and isinstance(b.get("last_7_days"), dict):
+        parts = []
+        for label in ("last_7_days", "all"):
+            x = b[label]
+            if x.get("plain"):
+                parts.append(f"{label.replace('_', ' ')} ${x['real']:,.2f} vs ${x['plain']:,.2f} plain "
+                             f"({_pct(x['real'], x['plain']):.1f}% saved, {x['requests']:,} requests)")
+        if parts:
+            out.append("   live bill: " + "; ".join(parts))
+    return out
+
+
+def cost_by_model_line(rows: list[dict]) -> list[str]:
+    """The cost model check per model, when there is more than one: a wrong price shows here."""
+    by: dict[str, list[float]] = {}
+    for r in rows:
+        v = by.setdefault(_version(r["model"]), [0.0, 0.0, 0])
+        v[0] += r["plain_cost"]
+        v[1] += r["real_cost"]
+        v[2] += 1
+    if len(by) < 2:
+        return []
+    return ["   by model: " + ", ".join(f"{m} ${a:,.2f} vs ${b:,.2f} ({n})" for m, (a, b, n) in sorted(by.items()))]
+
+
+def prediction_line(rows: list[dict]) -> list[str]:
+    """How often the cache model predicted a cache read right, from reply times and from
+    request times, overall and near the lifetime's end (where they can disagree)."""
+    tot = {k: [0, 0] for k in ("reply", "request", "edge_reply", "edge_request")}
+    for r in rows:
+        for k, (a, b) in (r.get("prediction") or {}).items():
+            if k in tot:
+                tot[k][0] += a
+                tot[k][1] += b
+    if not tot["reply"][1]:
+        return []
+    pct = lambda k: f"{100 * tot[k][0] / tot[k][1]:.1f}%" if tot[k][1] else "-"
+    return [f"   cache reads predicted: from reply times {pct('reply')}, from request times {pct('request')}; "
+            f"near the cache's expiry ({tot['edge_reply'][1]} gaps): {pct('edge_reply')} vs {pct('edge_request')}"]
 
 
 def cost_split_line(rows: list[dict]) -> list[str]:
@@ -1481,12 +1585,16 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
     lines = ["", "What TokenSaver would have saved on this machine (defaults, vs plain Claude Code, "
                  + ("with local AI, every request counted):" if mode == "full" else
                     "without local AI: `--benchmark full` includes it):")]
+    state = machine_state()
     lines += summarize(rows)
     lines += [f" cost model check (sessions without TokenSaver): plain modelled ${pc:,.2f} vs your real bill ${rc:,.2f}",
               *cost_split_line(plainside),
+              *cost_by_model_line(plainside),
+              *prediction_line(ok),
               cache_lifetime_line(ok, ttl_decision, main_ttl),
               measured_line(ok),
               *live_line(ok),
+              *machine_line(state),
               *trims_lines(ok, payback, after_s / 60),
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
@@ -1519,6 +1627,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
                          "escalated": {str(k): v for k, v in sorted(count.escalated.items())},
                          "transcript_duplicates": sum(r.get("transcript_duplicates") or 0 for r in rows)},
               "rejections": count.rejections,
+              "machine": state,
               "summary": lines[1:], "sessions": rows}
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     path = out or OUT_DIR / f"benchmark-{time.strftime('%Y%m%d-%H%M%S')}.json"
