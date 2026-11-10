@@ -734,6 +734,34 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             return None
         return max(sorted(floor_samples)[len(floor_samples) // 2], 0)
 
+    short: list[dict] = []          # shorter breaks priced as if trimmed (never applied)
+
+    def price_trim(k, r, hist, applied):
+        """(cand, s_now, s_new, reps) for a trim at request k, or (None, why not)."""
+        if not bg.worth_compacting(hist):
+            return None, "too little old history"
+        cand = bg.build(hist)
+        if not cand:
+            return None, "too little to remove"
+        if applied is not None and cand["cut"] <= applied["cut"]:
+            return None, "nothing new since the last trim"
+        cand = dict(cand, tail_end=len(hist))
+        now = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off")
+        new = passes.rewrite_messages(bg.apply(hist, cand), aliases="off")
+        n_now, n_new = _pair(lambda m: count(model, m), now, new, patient=True)
+        if not (n_now and n_new):
+            return None, "count failed"
+        n_now += round(factor * bg._signature_chars(now))
+        n_new += round(factor * bg._signature_chars(new))
+        # system + tools: not in the count (for a TokenSaver session, the floor
+        # measured before its first break: its usage is already trimmed)
+        floor = (floor_now() or 0) if through else max(r.context - n_now, 0)
+        s_now, s_new = n_now + floor, n_new + floor
+        p = prices[k]
+        w = cachettl.write_price(p, ours_ttls[k])
+        reps = (s_new * w - s_now * p.read) / max((s_now - s_new) * p.read, 1)
+        return (cand, s_now, s_new, reps), None
+
     last_epoch_start = 0
     for k, entry in enumerate(entries):
         r = entry[1]
@@ -752,35 +780,19 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                 applied, epoch = None, epoch + 1
             decided = None                     # (cand, s_now, s_new, reps) when a compaction was priced
             why_not = None
-            if k and gap > after_s and not bg.worth_compacting(hist):
-                why_not = "too little old history"
-            elif k and gap > after_s:
-                cand = bg.build(hist)
-                if not cand:
-                    why_not = "too little to remove"
-                elif applied is not None and cand["cut"] <= applied["cut"]:
-                    why_not = "nothing new since the last trim"
-                if cand and (applied is None or cand["cut"] > applied["cut"]):
-                    cand = dict(cand, tail_end=len(hist))
-                    now = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off")
-                    new = passes.rewrite_messages(bg.apply(hist, cand), aliases="off")
-                    n_now, n_new = _pair(lambda m: count(model, m), now, new, patient=True)
+            if k and gap > after_s:
+                decided, why_not = price_trim(k, r, hist, applied)
+                if decided is not None or why_not == "count failed":
                     decisions += 1
-                    if not (n_now and n_new):
-                        failed += 1
-                    if n_now and n_new:
-                        n_now += round(factor * bg._signature_chars(now))
-                        n_new += round(factor * bg._signature_chars(new))
-                        # system + tools: not in the count (for a TokenSaver session, the floor
-                        # measured before its first break: its usage is already trimmed)
-                        floor = (floor_now() or 0) if through else max(r.context - n_now, 0)
-                        s_now, s_new = n_now + floor, n_new + floor
-                        p = prices[k]
-                        w = cachettl.write_price(p, ours_ttls[k])
-                        reps = (s_new * w - s_now * p.read) / max((s_now - s_new) * p.read, 1)
-                        decided = (cand, s_now, s_new, reps)
-                    else:
-                        why_not = "count failed"
+                    failed += why_not == "count failed"
+            elif k and SHORT_BREAK_S < gap <= after_s:
+                # A shorter break, priced as if trimmed but never applied: does the minimum break
+                # leave money behind (mostly where a 5-minute cache has already expired)?
+                shadow, _ = price_trim(k, r, hist, applied)
+                if shadow is not None:
+                    short.append({"k": k, "cold": expired(k, gap, ours_ttls), "s_now": shadow[1],
+                                  "s_new": shadow[2], "reps": shadow[3],
+                                  "w": cachettl.write_price(prices[k], ours_ttls[k]), "read": prices[k].read})
             if why_not:
                 no_trim[why_not] = no_trim.get(why_not, 0) + 1
             cold = expired(k, gap, ours_ttls)
@@ -854,17 +866,35 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     # value = trimmed * read * (N - reps): the payback limit's own model, with the real N.
     # An estimate: it holds the session's later decisions fixed.
     applied_set = set(applied_at)
-    for rec in trims:
-        k, n = rec["k"], 0
+
+    def horizon(k) -> tuple[int, int]:
+        """Requests after k before the next free point, and that point's index."""
+        n = 0
         for j in range(k + 1, len(reqs)):
             gap_j = sim._ts(reqs[j].timestamp) - sim._ts(reqs[j - 1].timestamp)
             if entries[j][2] != entries[k][2] or (expired(j, gap_j, ours_ttls) and j not in kept_warm) \
                     or j in applied_set:
-                break
+                return n, j
             n += 1
-        rec["after"] = n
+        return n, len(reqs)
+
+    for rec in trims:
+        rec["after"] = n = horizon(rec["k"])[0]
         if not rec["cold"] and rec["s_new"] < rec["s_now"]:
             rec["value"] = round((rec["s_now"] - rec["s_new"]) * rec["read"] * (n - rec["reps"]) / 1e6, 4)
+    # Shorter breaks: only the first in each stretch up to the next free point (later ones
+    # would trim what the first already trimmed). On an expired cache the rewrite is paid
+    # anyway, so the trim also saves its write: trimmed * (write + read * N).
+    short_out, ends = [], set()
+    for rec in short:
+        n, end = horizon(rec["k"])
+        if end in ends or rec["s_new"] >= rec["s_now"]:
+            continue
+        ends.add(end)
+        cut = rec["s_now"] - rec["s_new"]
+        value = cut * (rec["w"] + rec["read"] * n) if rec["cold"] else cut * rec["read"] * (n - rec["reps"])
+        short_out.append({"cold": rec["cold"], "reps": round(rec["reps"], 1), "after": n,
+                          "s_now": rec["s_now"], "s_new": rec["s_new"], "value": round(value / 1e6, 4)})
 
     if keepalive_ends is not None and transform is None and ours_ttls[-1] == "1h" \
             and not ka.closed_by_user(d.session.path):
@@ -915,7 +945,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                        **({"value": r["value"]} if "value" in r else {}),
                        **({"parts": r["parts"], "kept_chars": r["kept"]} if r["applied"] else {})}
                       for r in trims],
-            "no_trim": no_trim,
+            "no_trim": no_trim, "short_trims": short_out,
             "transcript_duplicates": tinfo.get("duplicates", 0),
             "plain_tokens": sum(plain), "ours_tokens": sum(ours),
             "plain_cost": round(price(plain, set()), 4),
@@ -1161,13 +1191,14 @@ def keepalive_line(rows: list[dict], ends) -> str:
 
 
 LIMITS = (20, 33, 49, 70, 100, 150, 200)
+SHORT_BREAK_S = 300     # shorter breaks than `bg_after_min` priced from here (a 5-minute cache's life)
 
 
 def _usd(v: float) -> str:
     return f"{'-' if v < 0 else '+'}${abs(v):,.2f}"
 
 
-def trims_lines(rows: list[dict], payback: float) -> list[str]:
+def trims_lines(rows: list[dict], payback: float, after_min: float = 15) -> list[str]:
     """Why breaks did or didn't get a trim, what the trimmed part was made of, and which
     warm payback limit would have paid best on this history (from each decision's `value`)."""
     trims = [t for r in rows for t in r.get("trims") or []]
@@ -1175,7 +1206,8 @@ def trims_lines(rows: list[dict], payback: float) -> list[str]:
     for r in rows:
         for k, v in (r.get("no_trim") or {}).items():
             no_trim[k] = no_trim.get(k, 0) + v
-    if not trims and not no_trim:
+    short = [t for r in rows for t in r.get("short_trims") or []]
+    if not trims and not no_trim and not short:
         return []
     applied = [t for t in trims if t["applied"]]
     warm = [t for t in trims if not t["cold"] and t["s_new"] < t["s_now"]]
@@ -1207,6 +1239,12 @@ def trims_lines(rows: list[dict], payback: float) -> list[str]:
         out.append(" trimmed part (applied trims): " + ", ".join(
             f"{k} {100 * v / whole:.0f}%" for k, v in sorted(parts.items(), key=lambda kv: -kv[1]))
             + f"; the trim keeps {100 * kept / whole:.0f}% of its characters")
+    if short:
+        cold = [t for t in short if t["cold"]]
+        warm_ok = [t for t in short if not t["cold"] and t["reps"] <= payback]
+        out.append(f" trims at shorter breaks ({SHORT_BREAK_S // 60}-{after_min:g} min, priced, not applied; "
+                   f"estimate): on an expired cache {_usd(sum(t['value'] for t in cold))} ({len(cold)} breaks), "
+                   f"on a warm one that pays back {_usd(sum(t['value'] for t in warm_ok))} ({len(warm_ok)})")
     return out
 
 
@@ -1410,7 +1448,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               cache_lifetime_line(ok, ttl_decision, main_ttl),
               measured_line(ok),
               *live_line(ok),
-              *trims_lines(ok, payback),
+              *trims_lines(ok, payback, after_s / 60),
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
                  if count.errors else "")

@@ -14,8 +14,9 @@ from tokensaver import benchmark, pricing
 COUNT = lambda model, msgs, **k: 1000 + len(json.dumps(msgs)) // 4
 
 
-def _session(gaps_min, n=60):
+def _session(gaps_min, n=60, ttl="1h"):
     """Bash calls with big outputs, so the old part is worth trimming."""
+    key = "ephemeral_1h_input_tokens" if ttl == "1h" else "ephemeral_5m_input_tokens"
     d = Path(tempfile.mkdtemp())
     t, rows = _t.mktime((2026, 10, 20, 9, 0, 0, 0, 0, -1)), []
     for i in range(n):
@@ -28,7 +29,7 @@ def _session(gaps_min, n=60):
             "content": [{"type": "text", "text": f"running {i}"},
                         {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": f"ls {i}"}}],
             "usage": {"input_tokens": 2, "cache_read_input_tokens": 200_000, "output_tokens": 10,
-                      "cache_creation_input_tokens": 100, "cache_creation": {"ephemeral_1h_input_tokens": 100}}}})
+                      "cache_creation_input_tokens": 100, "cache_creation": {key: 100}}}})
         rows.append({"type": "user", "timestamp": stamp, "uuid": f"r{i}", "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": f"t{i}", "content": "\n".join(f"line {i}.{j} " + "x" * 60
                                                                                for j in range(300))}]}})
@@ -36,7 +37,7 @@ def _session(gaps_min, n=60):
             "id": f"m{i}b", "role": "assistant", "model": "claude-opus-5-5",
             "content": [{"type": "text", "text": f"done {i}"}],
             "usage": {"input_tokens": 2, "cache_read_input_tokens": 200_000, "output_tokens": 10,
-                      "cache_creation_input_tokens": 100, "cache_creation": {"ephemeral_1h_input_tokens": 100}}}})
+                      "cache_creation_input_tokens": 100, "cache_creation": {key: 100}}}})
     path = d / "s.jsonl"
     path.write_text("\n".join(json.dumps(r) for r in rows))
     return NS(session=NS(path=path, primary_model="claude-opus-5-5"),
@@ -72,7 +73,25 @@ class ReplayTrimsTest(unittest.TestCase):
 
     def test_no_text_in_the_record(self):
         r = benchmark.replay(_session({30: 20, 45: 90}), COUNT, 8, 900, 70, 0.264)
-        self.assertNotIn("line 3.", json.dumps({"trims": r["trims"], "no_trim": r["no_trim"]}))
+        self.assertNotIn("line 3.", json.dumps({"trims": r["trims"], "no_trim": r["no_trim"],
+                                                "short_trims": r["short_trims"]}))
+
+    def test_shorter_breaks_priced_not_applied(self):
+        p = pricing.price_for("claude-opus-5-5")
+        for ttl, cold in (("5m", True), ("1h", False)):
+            base = benchmark.replay(_session({}, ttl=ttl), COUNT, 8, 900, 70, 0.264)
+            r = benchmark.replay(_session({30: 8, 32: 8}, ttl=ttl), COUNT, 8, 900, 70, 0.264)
+            self.assertEqual((r["compactions"], base["compactions"]), (0, 0), "an 8-minute break never trims")
+            self.assertEqual(len(r["short_trims"]), 2 if cold else 1,
+                             "on a 5m cache each expired break is its own free point" if cold
+                             else "warm: both breaks share one stretch; only the first counts")
+            t = r["short_trims"][0]
+            self.assertEqual(t["cold"], cold, ttl)
+            cut = t["s_now"] - t["s_new"]
+            if cold:
+                want = cut * (p.write_5m + p.read * t["after"]) / 1e6
+                self.assertAlmostEqual(t["value"], want, delta=0.01)
+                self.assertGreater(t["value"], 0, "free on an expired cache")
 
 
 class TrimsLinesTest(unittest.TestCase):
@@ -93,6 +112,14 @@ class TrimsLinesTest(unittest.TestCase):
         self.assertIn("best limit here 100 requests (+$3.00 vs 70)", lines[1])
         self.assertIn("skipped ones would have made +$3.00 (1) and -$5.00 (1)", lines[1])
         self.assertIn("tool output 80%, user text 20%; the trim keeps 30%", lines[2])
+
+    def test_shorter_breaks_line(self):
+        short = [{"cold": True, "reps": 0, "after": 5, "s_now": 9, "s_new": 1, "value": 1.5},
+                 {"cold": False, "reps": 40, "after": 5, "s_now": 9, "s_new": 1, "value": -0.5},
+                 {"cold": False, "reps": 400, "after": 5, "s_now": 9, "s_new": 1, "value": -9.0}]
+        lines = benchmark.trims_lines([{"trims": [], "no_trim": {}, "short_trims": short}], 70)
+        self.assertEqual(lines[-1], " trims at shorter breaks (5-15 min, priced, not applied; estimate): "
+                                    "on an expired cache +$1.50 (1 breaks), on a warm one that pays back -$0.50 (1)")
 
     def test_quiet_without_breaks(self):
         self.assertEqual(benchmark.trims_lines([{"trims": [], "no_trim": {}}], 70), [])

@@ -1,12 +1,14 @@
-"""Fit background compaction's idle threshold to this user's own habits.
+"""What the simulation would pick for background compaction's idle threshold, as a
+report: nothing is fitted per user any more (2026-11-10), and values an earlier version
+fitted (`bg_after_min`, `bg_prep_idle_min`, `bg_warm_payback_max`) are removed. The fit
+saw only sessions that never went through TokenSaver (their sizes are already trimmed):
+16 of 41 here, where it came out flat (10 min +0.7 pts over 15, halves disagreeing). The
+benchmark prices shorter breaks on every session instead ("trims at shorter breaks"), and
+the defaults change, for everyone, only on what those lines show.
 
-Only `bg_after_min` is tuned: it is the one setting with a real effect
-(simulated on one user: 61 min 16%, 30 min 24%, 15 min 28% of the bill). The
-sizes (keep, index, minimum) measured flat within noise, and tuning noise only
-adds variance, so they stay at their defaults.
-
-"Measuring is hard" is the normal case, so every rule below falls back to the
-default rather than guessing:
+`bg_after_min` was the one setting with a real effect (simulated on one user: 61 min 16%,
+30 min 24%, 15 min 28% of the bill). The report's pick follows the old rules; each falls
+back to the default rather than guessing:
 
 * Not before the simulation has been checked against real tokens: fewer than
   MIN_AUDITED audited requests means "waiting", nothing changes.
@@ -119,13 +121,18 @@ def run(apply: bool = True, force: bool = False) -> Decision:
     payback = _payback(apply)
     default = config.SPECS["bg_after_min"].default
     current, source = config.resolve("bg_after_min")
+    if apply:                                # what an earlier version fitted
+        config.unset("bg_prep_idle_min", "tuned")
+        if source == "tuned":
+            config.unset("bg_after_min", "tuned")
     if source in ("user", "env"):
         return Decision(current, "user", f"you set bg_after_min yourself ({source}); not tuning it",
                         payback=payback)
+    current = default
     audited = _audited()
     if audited < MIN_AUDITED and not force:
-        d = Decision(current, "held", f"waiting for real token data: {audited}/{MIN_AUDITED} audited requests",
-                     payback=payback)
+        d = Decision(default, "default", f"not fitted per user; no simulation report before "
+                                         f"{MIN_AUDITED} audited requests ({audited} so far)", payback=payback)
         _record(d, apply)
         return d
     data = sim.sessions()
@@ -157,11 +164,11 @@ def run(apply: bool = True, force: bool = False) -> Decision:
     d = decide(table, halves, current, default, prev, counts)
     d.why += (f" [{pass_why}; token factor {factor_why}; {counts['sessions']} sessions, "
               f"{counts['moments']} idle moments]")
-    if apply and d.source == "tuned":
-        config.set_value("bg_after_min", d.value, "tuned", why=d.why,
-                         evidence={"table": table, "halves": halves, "counts": counts})
-        config.set_value("bg_prep_idle_min", max(5.0, min(10.0, d.value - 4)), "tuned",
-                         why=f"derived from bg_after_min={d.value:g}")
+    if d.value != default:
+        d.why = f"not fitted per user; the simulation alone would pick {d.value:g} min: {d.why}"
+    else:
+        d.why = f"not fitted per user: {d.why}"
+    d.value, d.source = default, "default"
     _record(d, apply, best=best_now)
     d.payback = payback
     return d

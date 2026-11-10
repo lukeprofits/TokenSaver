@@ -75,8 +75,40 @@ class PaybackTest(unittest.TestCase):
         self.assertEqual(config.resolve("bg_warm_payback_max"), (40.0, "user"))
 
     def tearDown(self):
-        for src in ("tuned", "user"):
-            config.unset("bg_warm_payback_max", src)
+        for name in ("bg_warm_payback_max", "bg_after_min", "bg_prep_idle_min"):
+            for src in ("tuned", "user"):
+                config.unset(name, src)
+
+
+class AfterMinNotFittedTest(unittest.TestCase):
+    """bg_after_min is reported, never fitted: a fitted value (and its derived prep time) is
+    removed by a real run, left by a dry run; a user's own value is kept."""
+
+    def tearDown(self):
+        for name in ("bg_warm_payback_max", "bg_after_min", "bg_prep_idle_min"):
+            for src in ("tuned", "user"):
+                config.unset(name, src)
+
+    def run_tune(self, apply):
+        from unittest import mock
+        with mock.patch.object(tune, "_audited", return_value=0), mock.patch.object(tune, "_record"):
+            return tune.run(apply=apply)
+
+    def test_fitted_values_removed(self):
+        config.set_value("bg_after_min", 10.0, "tuned")
+        config.set_value("bg_prep_idle_min", 6.0, "tuned")
+        self.run_tune(apply=False)
+        self.assertEqual(config.resolve("bg_after_min"), (10.0, "tuned"), "dry run changes nothing")
+        d = self.run_tune(apply=True)
+        self.assertEqual((d.value, d.source), (15.0, "default"))
+        self.assertEqual(config.resolve("bg_after_min"), (15.0, "default"))
+        self.assertEqual(config.resolve("bg_prep_idle_min")[1], "default")
+
+    def test_user_value_kept(self):
+        config.set_value("bg_after_min", 30.0, "user")
+        d = self.run_tune(apply=True)
+        self.assertEqual((d.value, d.source), (30.0, "user"))
+        self.assertEqual(config.resolve("bg_after_min"), (30.0, "user"))
 
 
 class SimRulesTest(unittest.TestCase):
