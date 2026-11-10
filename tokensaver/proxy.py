@@ -47,7 +47,7 @@ import urllib.request
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import audit, background, config, keepalive, machine, passes, pricing, prune, vault
+from . import audit, background, cachettl, config, keepalive, machine, passes, pricing, prune, vault
 
 # Settings come from `config`: the file, or env vars for a proxy started by
 # hand. A launchd-run proxy sees no shell env, so the file is the source.
@@ -80,10 +80,38 @@ REWRITE = config.get("rewrite")
 REWRITE_CLASSES = {"main"}
 
 
-# Claude Code caches with a 1h TTL, refreshed on every hit (measured
-# 2026-10-13: every cache write was ephemeral_1h). Past this gap the prefix
-# is being rebuilt anyway, so changing it costs nothing extra. One minute of margin.
+# A cached prefix lives 1h or 5m from its last use, as each request's markers say
+# (`cachettl`: Claude Code picks 1h only for a subscription's main thread outside extra
+# usage). Past that gap the prefix is being rebuilt anyway, so changing it costs nothing
+# extra. One minute of margin. EXPIRED_S is the 1h value, used when the TTL is unknown.
 EXPIRED_S = 61 * 60
+_TTL: dict[str, list] = {}       # session -> [TTL of the previous main request, of this one]
+
+
+def _note_ttl(session: str | None, request: dict) -> None:
+    """Once per main request, before anything decides on its gap."""
+    if not session:
+        return
+    old = _TTL.get(session)
+    if old is not None:
+        prev = old[1]
+    else:
+        try:
+            prev = _bg_load(session).get("ttl")
+        except Exception:
+            prev = None
+    _TTL[session] = [prev, cachettl.of_request(request)]
+    if len(_TTL) > 200:
+        _TTL.pop(next(iter(_TTL)))
+
+
+def _expired_s(session: str | None, next_request: bool = False) -> float:
+    """The gap past which the cache this request (or, `next_request`, the next one)
+    would read has expired."""
+    t = (_TTL.get(session or "") or [None, None])[1 if next_request else 0]
+    return cachettl.seconds(t) + 60
+
+
 _STATE_LOCK = threading.Lock()
 def _state_path(session: str):
     safe = "".join(c for c in session if c.isalnum() or c in "-_")[:80]
@@ -595,7 +623,7 @@ def _payback(prepared: dict, applied: dict, live: dict) -> dict:
         return {"payback_requests": None, "payback_why": "no estimate"}
     sent_new = round(sent_now * new / current)
     p = pricing.price_for((live.get("skeleton") or {}).get("model") or "")
-    w1, rd = (p.write_1h, p.read) if p else (8.0, 0.2)
+    w1, rd = (cachettl.write_price(p, live.get("ttl")), p.read) if p else (8.0, 0.2)
     saved = sent_now - sent_new
     out = {"sent_now": sent_now, "sent_new": sent_new}
     if saved <= 0:
@@ -712,7 +740,8 @@ def _bg(messages: list, session: str | None, skeleton: dict | None = None,
     # NOT kept here (user decision, 2026-10-22): credentials live only for an
     # in-flight request and the audit jobs it queues. Real counts for a
     # free-point decision are made on the request that reaches it.
-    _LIVE[session] = {"last": now, "messages": messages, "skeleton": skeleton or {}}
+    _LIVE[session] = {"last": now, "messages": messages, "skeleton": skeleton or {},
+                      "ttl": (_TTL.get(session) or [None, None])[1]}
     with _STATE_LOCK:
         st = _bg_load(session)
         info: dict = {}
@@ -732,8 +761,10 @@ def _bg(messages: list, session: str | None, skeleton: dict | None = None,
         if last is not None:
             info["gap_s"] = round(now - float(last))     # for the alias free-point check
         st["last"] = now
+        if (_TTL.get(session) or [None, None])[1]:
+            st["ttl"] = _TTL[session][1]
         _bg_save(session, st)
-        cold = last is not None and now - float(last) > EXPIRED_S
+        cold = last is not None and now - float(last) > _expired_s(session)
         if expired and pending and (pending.get("gate") or {}).get("passed"):
             # Cold: the cache is being rebuilt anyway, so a smaller history is
             # strictly cheaper. Warm: only if it repays before the next free
@@ -907,7 +938,7 @@ def _session_setup(session: str | None, messages: list | None = None,
             free = None
             if "passes_off" not in st:
                 free = "first seen"
-            elif gap_s is not None and gap_s > EXPIRED_S:
+            elif gap_s is not None and gap_s > _expired_s(session):
                 free = "cache expired"
             if st.pop("free_point", None):
                 free = "compaction"
@@ -964,7 +995,7 @@ def _watch(session: str | None, request_class: str | None, path: str,
         return
     now = time.time()
     w = _WATCH.setdefault(session, {"last": None, "zero": 0, "errors": []})
-    warm = w["last"] is not None and now - w["last"] < EXPIRED_S - 60
+    warm = w["last"] is not None and now - w["last"] < _expired_s(session) - 60
     w["last"] = now
     w["errors"] = (w["errors"] + [bool(stats.get("error"))])[-FALLBACK_ERRORS[1]:]
     cold_ok = not warm or stats.get("bg_applied")
@@ -1484,11 +1515,12 @@ def estimate(session: str) -> dict:
             return res
         nxt = round(100 * (1 - max(out - to_real(extra), 0) / base))
         gap = time.time() - n["t"]
-        if gap > BG_APPLY_AFTER_S and (gap > EXPIRED_S or _warm_ok(pending)[0]):
+        expired_s = _expired_s(session, next_request=True)
+        if gap > BG_APPLY_AFTER_S and (gap > expired_s or _warm_ok(pending)[0]):
             res["pct"] = nxt
         elif gap <= BG_APPLY_AFTER_S:
             res.update(next_pct=nxt, in_s=round(BG_APPLY_AFTER_S - gap), done=False)
-        elif gap <= EXPIRED_S:
+        elif gap <= expired_s:
             res["done"] = False             # warm and not worth it yet; the cache expiring will make it free
         return res
     except Exception:
@@ -1634,7 +1666,7 @@ def _decide(session: str, request: dict, original: list, cold: bool, headers: di
         mode = ({"mode": "plan", "plan": plan, "tokens_off": n["off"], "tokens_plan": n["plan"]}
                 if use_plan else {"mode": "off", "tokens_off": n["off"], "tokens_plan": n.get("plan")})
         p = pricing.price_for(request.get("model") or "")
-        w1, rd = (p.write_1h, p.read) if p else (8.0, 0.2)
+        w1, rd = (cachettl.write_price(p, cachettl.of_request(request)), p.read) if p else (8.0, 0.2)
         if best >= n["now"]:
             ok, why = False, f"counted: {best:,} tokens with it vs {n['now']:,} without"
         elif cold:
@@ -1706,6 +1738,8 @@ def _rewrite(body: bytes | None, path: str, request_class: str | None,
             return body, {}
         if session:
             _lru_put(_MAIN_HIST, session, messages)
+            if not _decided:
+                _note_ttl(session, request)
         skeleton = {k: request[k] for k in ("model", "system", "tools", "tool_choice", "thinking")
                     if k in request}
         original = messages

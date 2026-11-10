@@ -29,10 +29,9 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
-from . import vault
+from . import cachettl, vault
 from .pricing import price_for
 
-TTL_S = 3600
 MISS_TOKENS = 50_000
 BYTES_TO_TOKENS = 0.70      # measured: tokens saved per byte saved, 272 audited requests
 
@@ -121,6 +120,7 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
 
     b = Bill()
     last: dict = {}            # session -> (time, plain size, sent size) of its last main request
+    ttl_of: dict = {}          # session -> cache lifetime of its last main request (`cachettl`)
     last_main_id: dict = {}
     for ts, session, cls, u, rw, p, rid in reqs:
         inp = int(u.get("input_tokens") or 0)
@@ -144,7 +144,9 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
         b.real += real
         t = _t(ts)
         prev = last.get(session)
-        warm = prev is not None and t - prev[0] < TTL_S
+        w1 = int((u.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0)
+        ttl = ("1h" if w1 >= w5 else "5m") if (w1 or w5) else ttl_of.get(session)
+        warm = prev is not None and t - prev[0] < cachettl.seconds(ttl_of.get(session) or ttl)
         cause = None
         if warm and w > MISS_TOKENS:
             if cls not in ("main", "auxiliary", "compaction"):
@@ -165,7 +167,8 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
                 cause = "unknown (possibly Anthropic-side)"
         ours = cause is not None and not cause.startswith("Claude Code")
         if cause:
-            b.misses.append(Miss(ts, session or "", cls, w, w * (p.write_1h - p.read) / 1e6, cause, ours))
+            extra = w * (cachettl.write_price(p, ttl) - p.read) / 1e6
+            b.misses.append(Miss(ts, session or "", cls, w, extra, cause, ours))
         # plain Claude, same request
         if cls == "main":
             if warm and not (cause and not ours):
@@ -179,6 +182,7 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
             # assumes the previous request's prefix is read, as for plain.
             c_rd = rd if (cause or not warm) else min(prev[2], sent)
             last[session] = (t, plain_size, sent)
+            ttl_of[session] = ttl
             last_main_id[session] = rid
         elif (rw.get("aux_unmatched") == "separate" or cls not in ("auxiliary", "compaction")
               or (cause or "").startswith("Claude Code's separate")):

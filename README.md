@@ -250,7 +250,12 @@ history (29 days, interactive sessions only) it cut the bill by under 1%
 includes it). That is small because Claude Code compacts a session of 200K
 tokens or more by itself about 55 minutes into a break (its `idleCompaction`
 setting, on by default), so keep-alive leaves those alone and only helps
-smaller ones. On a Pro or Max plan, these reads count toward your plan's usage.
+smaller ones. It needs a 1-hour cache, which Claude Code uses only when you log
+in with a Claude subscription and aren't in extra usage, or set
+`ENABLE_PROMPT_CACHING_1H=1`. Otherwise the cache lasts 5 minutes, and
+keep-alive stays off; break-time trims then apply at any break longer than
+15 minutes, since the cache is gone anyway. On a Pro or Max plan, these reads
+count toward your plan's usage.
 
 ```sh
 tokensaver keepalive        # on or off, when it stops today, what it saved and spent

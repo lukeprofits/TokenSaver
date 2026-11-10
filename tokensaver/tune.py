@@ -40,7 +40,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from . import background, config, sim, vault
+from . import background, cachettl, config, sim, vault
 
 CANDIDATES = (10.0, 15.0, 20.0, 30.0, 45.0, 61.0)
 MIN_AUDITED = 20
@@ -125,13 +125,14 @@ def remaining_after_breaks(data: list, min_tokens: int | None) -> tuple[list[int
     for d in data:
         rq = d.requests
         ts = [sim._ts(r.timestamp) for r in rq]
+        exp = [cachettl.seconds(t) + 60 for t in cachettl.per_request(rq)]   # entry lifetime
         had = False
         for i in range(1, len(rq)):
-            if not (15 * 60 < ts[i] - ts[i - 1] <= 61 * 60 and rq[i].context > sim.threshold(d, min_tokens)):
+            if not (15 * 60 < ts[i] - ts[i - 1] <= exp[i - 1] and rq[i].context > sim.threshold(d, min_tokens)):
                 continue
             n = 0
             for j in range(i + 1, len(rq)):
-                if ts[j] - ts[j - 1] > 61 * 60 or rq[j].context < 0.5 * rq[j - 1].context:
+                if ts[j] - ts[j - 1] > exp[j - 1] or rq[j].context < 0.5 * rq[j - 1].context:
                     break
                 n += 1
             out.append(n)

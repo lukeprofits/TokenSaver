@@ -69,7 +69,7 @@ import urllib.request
 from pathlib import Path
 
 from . import names
-from . import __version__, audit, background as bg, config, passes, pricing, sim, transcripts
+from . import __version__, audit, background as bg, cachettl, config, passes, pricing, sim, transcripts
 
 # Tokens per signature char when this machine can't measure (see thinking_factors):
 # the one default, kept with its history in background.TOKENS_PER_SIGNATURE_CHAR.
@@ -658,6 +658,10 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     reqs = [e[1] for e in entries]
     model = d.session.primary_model
     prices = [pricing.price_for(r.model) or d.price for r in reqs]
+    # Each request's cache lifetime, from what its usage says it wrote (`cachettl`): a request
+    # reads the previous one's entry while the gap is within that entry's lifetime.
+    ttls = cachettl.per_request(reqs)
+    expired = lambda k, gap: k > 0 and gap > cachettl.seconds(ttls[k - 1])
     removed_at: dict[int, int] = {}
     sig_at: dict[int, int] = {}    # thinking signature chars TokenSaver removed (priced by `factor`)
     epochs: list[int] = []
@@ -727,10 +731,11 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                         floor = (floor_now() or 0) if through else max(r.context - n_now, 0)
                         s_now, s_new = n_now + floor, n_new + floor
                         p = prices[k]
-                        reps = (s_new * p.write_1h - s_now * p.read) / max((s_now - s_new) * p.read, 1)
+                        w = cachettl.write_price(p, ttls[k])
+                        reps = (s_new * w - s_now * p.read) / max((s_now - s_new) * p.read, 1)
                         decided = (cand, s_now, s_new, reps)
-            cold = gap > 3600
-            if keepalive_ends is not None and k:
+            cold = expired(k, gap)
+            if keepalive_ends is not None and k and ttls[k - 1] == "1h":   # live: 1-hour caches only
                 # The break before this request: would keep-alive have kept the cache, and at what cost?
                 big = k >= ka.BIG_REQUESTS or returned or reqs[k - 1].context >= ka.BIG_TOKENS
                 warm_trim = decided is not None and decided[2] < decided[1] and decided[3] <= payback
@@ -789,7 +794,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
 
     rem, sig_rem = fill(removed_at), fill(sig_at)
 
-    if keepalive_ends is not None and transform is None and not ka.closed_by_user(d.session.path):
+    if keepalive_ends is not None and transform is None and ttls[-1] == "1h" \
+            and not ka.closed_by_user(d.session.path):
         # After the session's last request: bumps for someone who never came back (as it runs
         # live while the session stays open; a /clear or /exit closed it, so none then).
         last = len(reqs) - 1
@@ -803,8 +809,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         cost, prev = 0.0, None
         for k, (r, size, p) in enumerate(zip(reqs, sizes, prices)):
             gap = sim._ts(r.timestamp) - sim._ts(reqs[k - 1].timestamp) if k else 0
-            hit = 0 if prev is None or (gap > 3600 and k not in warm) or k in rebuilt else min(prev, size)
-            cost += (hit * p.read + (size - hit) * p.write_1h + r.out * p.out) / 1e6
+            hit = 0 if prev is None or (expired(k, gap) and k not in warm) or k in rebuilt else min(prev, size)
+            cost += (hit * p.read + (size - hit) * cachettl.write_price(p, ttls[k]) + r.out * p.out) / 1e6
             prev = size
         # a bump reads the context its session had then
         return cost + sum(n * sizes[i] * prices[i].read / 1e6 for i, n in bumps)
@@ -841,6 +847,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             "keepalive_bumps": sum(n for _, n in bump_events), "keepalive_kept": len(kept_warm),
             "keepalive_cost": round(bump_cost, 4), "keepalive_saved": round(kept_saved, 4),
             "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4),
+            "write_5m_tokens": sum(r.write_5m for r in reqs), "write_1h_tokens": sum(r.write_1h for r in reqs),
             "through_tokensaver": through,
             # what was billed, priced by the same cache model as plain (so the two compare fairly)
             **({"floor_tokens": floor_now(),
@@ -922,6 +929,16 @@ def measured_line(rows: list[dict]) -> str:
             f"(${billed:,.2f} for what was sent vs ${plain:,.2f} plain, rebuilt from the original messages, "
             f"the same cost model; you were billed ${real:,.2f}). Today's TokenSaver on them, replayed: "
             f"{_pct(ours, plain):.1f}% cheaper")
+
+
+def cache_lifetime_line(rows: list[dict]) -> str:
+    """Which cache lifetime the sessions used (each request is priced by its own)."""
+    short = sum(1 for r in rows if r.get("write_5m_tokens", 0) > r.get("write_1h_tokens", 0))
+    if not short:
+        return " cache lifetime: 1 hour"
+    return (f" cache lifetime: 5 minutes on {short} of {len(rows)} sessions (Claude Code uses 1 hour only "
+            "for a Claude subscription login outside extra usage, or with ENABLE_PROMPT_CACHING_1H=1); "
+            "keep-alive needs 1 hour, so it is left out there")
 
 
 def keepalive_line(rows: list[dict], ends) -> str:
@@ -1123,6 +1140,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
                     "without local AI: `--benchmark full` includes it):")]
     lines += summarize(rows)
     lines += [f" cost model check (sessions without TokenSaver): plain modelled ${pc:,.2f} vs your real bill ${rc:,.2f}",
+              cache_lifetime_line(ok),
               measured_line(ok),
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"

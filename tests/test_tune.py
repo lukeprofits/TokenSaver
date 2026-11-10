@@ -82,8 +82,9 @@ class SimRulesTest(unittest.TestCase):
         for g in [0] + gaps_min:
             t += g * 60
             stamp = __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime(t))
-            rq.append(NS(timestamp=stamp, context=ctx, inp=5, read=ctx - 1000, write=995, out=500))
-        price = NS(inp=4.0, out=20.0, write_1h=8.0, read=0.2)
+            rq.append(NS(timestamp=stamp, context=ctx, inp=5, read=ctx - 1000, write=995, write_5m=0,
+                         write_1h=995, out=500))
+        price = NS(inp=4.0, out=20.0, write_5m=5.0, write_1h=8.0, read=0.2)
         data = NS(price=price, requests=rq, stem="s", session=NS(floor=50_000), blocks=[])
         saved = sim._charge_rereads
         self.addCleanup(setattr, sim, "_charge_rereads", saved)

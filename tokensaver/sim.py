@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import background, passes
+from . import background, cachettl, passes
 from .pricing import resolve
 from .transcripts import DEFAULT_ROOT, Session, load
 
@@ -252,8 +252,9 @@ def price_session(data: SessionData, shrink: float | None, after_s: float, min_t
       minus the recent part kept verbatim); a later one only adds what goes beyond
       the reduction already in place (measured: a second compaction saved 68K
       tokens per request, not the full shrink of an already-shrunk request);
-    - on a warm cache (gap up to the 61 min TTL) it applies only if its payback
-      (requests needed to repay the fresh write) is within `payback_max`
+    - on a warm cache (gap within the cache lifetime, 1h or 5m, plus a minute) it
+      applies only if its payback (requests needed to repay the fresh write, at
+      that lifetime's write price) is within `payback_max`
       (default: config `bg_warm_payback_max`); on a cold cache always."""
     from . import config
     if payback_max is None:
@@ -266,7 +267,9 @@ def price_session(data: SessionData, shrink: float | None, after_s: float, min_t
     base = gross = net = 0.0
     red, prev, apps, rereads = 0.0, 0, 0, 0
     extra = [0] * (len(rq) + 2)
+    ttls = cachettl.per_request(rq)        # each request's cache lifetime, from its usage
     for i, r in enumerate(rq):
+        w = cachettl.write_price(p, ttls[i])
         c = r.context
         if prev and c < 0.5 * prev:
             red = 0.0                          # Claude Code compacted: a new history
@@ -277,30 +280,34 @@ def price_session(data: SessionData, shrink: float | None, after_s: float, min_t
         if k and gap > after_s and c > min_tokens:
             new = c - max(c - floor - keep, 0) * k   # built from the original history
             if new < sim:
-                warm = gap <= 61 * 60
+                warm = gap <= cachettl.seconds(ttls[i - 1]) + 60
                 if not warm:
                     n = 0.0
                 elif p.read > 0:
-                    n = (new * p.write_1h - sim * p.read) / ((sim - new) * p.read)
+                    n = (new * w - sim * p.read) / ((sim - new) * p.read)
                 else:
                     n = float("inf")           # reads free: a fresh write never repays
                 if not warm or n <= payback_max:
                     if warm:                   # the new prefix is a fresh write
-                        write_extra = new * (p.write_1h - p.read) / 1e6
+                        write_extra = new * (w - p.read) / 1e6
                     red = c - new
                     sim = new
                     apps += 1
                     rereads += _charge_rereads(data, i, keep_chars, extra, len(rq))
-        cost = (r.inp * p.inp + r.read * p.read + r.write * p.write_1h + r.out * p.out) / 1e6
+        w5 = min(r.write_5m, r.write)
+        cost = (r.inp * p.inp + r.read * p.read + (r.write - w5) * p.write_1h + w5 * p.write_5m
+                + r.out * p.out) / 1e6
         base += cost
         # What is written can be no more than the (reduced) prompt: a rebuild
         # after a compaction writes the compacted prefix, not the original.
         write = min(r.write, max(sim - r.inp, 0))
         read = max(sim - write - r.inp, 0)
-        g = (r.inp * p.inp + read * p.read + write * p.write_1h + r.out * p.out) / 1e6 + write_extra
+        w5 = min(w5, write)                    # the same split as billed
+        g = (r.inp * p.inp + read * p.read + (write - w5) * p.write_1h + w5 * p.write_5m
+             + r.out * p.out) / 1e6 + write_extra
         gross += g
         carried = sum(extra[:i + 1])
-        net += g + carried * p.read / 1e6 + extra[i] * (p.write_1h - p.read) / 1e6
+        net += g + carried * p.read / 1e6 + extra[i] * (w - p.read) / 1e6
     return Result(data.stem, base, gross, net, apps, rereads)
 
 

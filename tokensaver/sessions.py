@@ -17,8 +17,8 @@ def render(sessions: list[Session], limit: int = 15) -> str:
         p = resolve(s.primary_model).price
         if not p or p.read == 0:
             continue
-        cost = sum(r.read * p.read + r.write * p.write_1h + r.out * p.out
-                   for r in s.requests) / 1e6
+        cost = sum(r.read * p.read + (r.write - min(r.write_5m, r.write)) * p.write_1h
+                   + min(r.write_5m, r.write) * p.write_5m + r.out * p.out for r in s.requests) / 1e6
         peak = max((r.context for r in s.requests), default=0)
         rows.append((cost, peak, len(s.requests), s))
     rows.sort(reverse=True, key=lambda r: r[0])
