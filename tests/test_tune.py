@@ -59,9 +59,9 @@ class PaybackTest(unittest.TestCase):
         r = tune.decide_payback([50] * 5, 2, 70.0, 70.0)
         self.assertEqual((r.value, r.source), (70.0, "default"))
 
-    def test_fits_p40_and_clamps(self):
-        r = tune.decide_payback(sorted(range(0, 400, 10)), 8, 70.0, 70.0)
-        self.assertEqual((r.value, r.source), (160.0, "tuned"))
+    def test_fits_the_median_and_clamps(self):
+        r = tune.decide_payback(sorted(range(0, 300, 10)), 8, 70.0, 70.0)
+        self.assertEqual((r.value, r.source), (150.0, "tuned"))
         r = tune.decide_payback([1000] * 30, 8, 70.0, 70.0)
         self.assertEqual(r.value, 200.0, "clamped to the setting's upper bound")
         r = tune.decide_payback([1] * 30, 8, 70.0, 70.0)

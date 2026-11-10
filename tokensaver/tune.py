@@ -28,9 +28,12 @@ default rather than guessing:
 the cache is warm must repay its fresh write before the next free point (an
 expired cache or Claude Code's own compaction). How many requests a user makes
 after a 15-61 min break is a habit, measured here from their own history; the
-setting is that count's PAYBACK_QUANTILE (p40: repay in more than half of
-breaks). Same insufficiency rules (MIN_MOMENTS, MIN_SESSIONS_WITH), clamped to
-bounds, never over a user value, and moved only on a change of over 20%.
+setting is that count's median (PAYBACK_QUANTILE). Measured 2026-11-10 with the
+benchmark's priced warm trims (each one's gain or loss on the requests that really
+followed), 30 days here: limit 33 +$22.8, 49 (the p40 fit then) +$25.4, 70 +$28.2,
+100 +$16.4, none -$41.6. The mean is the textbook rule but rare long runs pull it up, and
+too high a limit loses fast; the median sits near the best value. Same insufficiency
+rules (MIN_MOMENTS, MIN_SESSIONS_WITH), clamped to bounds, never over a user value, and moved only on a change of over 20%.
 
 Local only: replays transcripts on disk, no API calls.
 """
@@ -49,7 +52,7 @@ MIN_DAYS = 7
 MIN_MOMENTS = 15
 MIN_SESSIONS_WITH = 5
 MIN_GAIN_PP = 1.0
-PAYBACK_QUANTILE = 0.4
+PAYBACK_QUANTILE = 0.5
 PAYBACK_MIN_CHANGE = 0.2
 
 
@@ -150,8 +153,8 @@ def decide_payback(remaining: list[int], sessions_with: int, current: float, def
     q = float(remaining[int(PAYBACK_QUANTILE * len(remaining))])
     value = config.clamp(spec, q)
     if current and abs(value - current) <= PAYBACK_MIN_CHANGE * current:
-        return Decision(current, "held", f"p40 of requests after a break is {q:g}; within 20% of {current:g}")
-    return Decision(value, "tuned", f"p40 of requests after a break is {q:g} "
+        return Decision(current, "held", f"median requests after a break is {q:g}; within 20% of {current:g}")
+    return Decision(value, "tuned", f"median requests after a break is {q:g} "
                                     f"({len(remaining)} breaks in {sessions_with} sessions)")
 
 
