@@ -633,6 +633,37 @@ def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict
 
 # ---- one session ----------------------------------------------------------------
 
+def _parts(messages: list) -> dict[str, int]:
+    """Characters of `messages` by kind: what a trim had to work with (numbers only)."""
+    out: dict[str, int] = {}
+
+    def add(kind, n):
+        if n:
+            out[kind] = out.get(kind, 0) + n
+    for m in messages:
+        content = m.get("content")
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type")
+            if t == "text":
+                text = b.get("text") or ""
+                add("reminders" if text.lstrip().startswith("<system-reminder>")
+                    else "user text" if m.get("role") == "user" else "assistant text", len(text))
+            elif t in ("thinking", "redacted_thinking"):
+                add("thinking", len(b.get("thinking") or "") + len(b.get("signature") or b.get("data") or ""))
+            elif t == "tool_use":
+                add("tool calls", len(json.dumps(b.get("input"), ensure_ascii=False)))
+            elif t == "tool_result":
+                c = b.get("content")
+                add("tool output", len(c) if isinstance(c, str)
+                    else sum(len(x.get("text") or "") for x in c or [] if isinstance(x, dict)))
+            else:
+                add("other", len(json.dumps(b, ensure_ascii=False)))
+    return out
+
+
 def replay(d, count: Counter, step: int, after_s: float, payback: float, factor: float,
            transform=None, prune=None, keepalive_ends: dict | None = None,
            main_ttl: str | None = None) -> dict:
@@ -671,6 +702,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     sig_at: dict[int, int] = {}    # thinking signature chars TokenSaver removed (priced by `factor`)
     epochs: list[int] = []
     applied, epoch, decisions, applied_at = None, 0, 0, []
+    trims: list[dict] = []         # every priced trim decision, applied or not (numbers only)
+    no_trim: dict[str, int] = {}   # breaks where no trim was priced, by reason
     failed = 0                     # counts Anthropic refused for this session
 
     # A session that went through TokenSaver: its usage numbers are what TokenSaver sent, so
@@ -718,8 +751,15 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             if applied is not None and bg.apply(hist, applied) is None:
                 applied, epoch = None, epoch + 1
             decided = None                     # (cand, s_now, s_new, reps) when a compaction was priced
-            if k and gap > after_s and bg.worth_compacting(hist):
+            why_not = None
+            if k and gap > after_s and not bg.worth_compacting(hist):
+                why_not = "too little old history"
+            elif k and gap > after_s:
                 cand = bg.build(hist)
+                if not cand:
+                    why_not = "too little to remove"
+                elif applied is not None and cand["cut"] <= applied["cut"]:
+                    why_not = "nothing new since the last trim"
                 if cand and (applied is None or cand["cut"] > applied["cut"]):
                     cand = dict(cand, tail_end=len(hist))
                     now = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off")
@@ -739,6 +779,10 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                         w = cachettl.write_price(p, ours_ttls[k])
                         reps = (s_new * w - s_now * p.read) / max((s_now - s_new) * p.read, 1)
                         decided = (cand, s_now, s_new, reps)
+                    else:
+                        why_not = "count failed"
+            if why_not:
+                no_trim[why_not] = no_trim.get(why_not, 0) + 1
             cold = expired(k, gap, ours_ttls)
             if keepalive_ends is not None and k and ours_ttls[k - 1] == "1h":   # live: 1-hour caches only
                 # The break before this request: would keep-alive have kept the cache, and at what cost?
@@ -760,11 +804,16 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                 returned = True
             if decided is not None:
                 cand, s_now, s_new, reps = decided
+                rec = {"k": k, "cold": cold, "s_now": s_now, "s_new": s_new, "reps": reps,
+                       "applied": False, "w": cachettl.write_price(prices[k], ours_ttls[k]),
+                       "read": prices[k].read}
                 if s_new < s_now and (cold or reps <= payback):
+                    rec.update(applied=True, parts=_parts(hist[:cand["cut"]]), kept=len(cand["text"]))
                     if prune is not None:
                         cand = prune(cand, hist)
                     applied, epoch = cand, epoch + 1
                     applied_at.append(k)
+                trims.append(rec)
             ours = None
             needed = (applied_at and applied_at[-1] == k) or k == len(entries) - 1 or k == 0
             sample = k % step == 0
@@ -798,6 +847,24 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         return vals
 
     rem, sig_rem = fill(removed_at), fill(sig_at)
+
+    # Each warm trim decision priced on what really followed: applying it pays the rewrite now
+    # and saves the trimmed tokens' read on every request until the next free point (the cache
+    # expiring, Claude Code compacting, or a later trim), where the trim would be free anyway.
+    # value = trimmed * read * (N - reps): the payback limit's own model, with the real N.
+    # An estimate: it holds the session's later decisions fixed.
+    applied_set = set(applied_at)
+    for rec in trims:
+        k, n = rec["k"], 0
+        for j in range(k + 1, len(reqs)):
+            gap_j = sim._ts(reqs[j].timestamp) - sim._ts(reqs[j - 1].timestamp)
+            if entries[j][2] != entries[k][2] or (expired(j, gap_j, ours_ttls) and j not in kept_warm) \
+                    or j in applied_set:
+                break
+            n += 1
+        rec["after"] = n
+        if not rec["cold"] and rec["s_new"] < rec["s_now"]:
+            rec["value"] = round((rec["s_now"] - rec["s_new"]) * rec["read"] * (n - rec["reps"]) / 1e6, 4)
 
     if keepalive_ends is not None and transform is None and ours_ttls[-1] == "1h" \
             and not ka.closed_by_user(d.session.path):
@@ -843,6 +910,12 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                      for k in kept_warm if k not in rebuilt)
     return {"requests": len(reqs), "model": model, "breaks": breaks, "counted": len(removed_at),
             "decisions": decisions, "compactions": len(applied_at), "count_failures": failed,
+            "trims": [{"cold": r["cold"], "applied": r["applied"], "reps": round(r["reps"], 1),
+                       "after": r["after"], "s_now": r["s_now"], "s_new": r["s_new"],
+                       **({"value": r["value"]} if "value" in r else {}),
+                       **({"parts": r["parts"], "kept_chars": r["kept"]} if r["applied"] else {})}
+                      for r in trims],
+            "no_trim": no_trim,
             "transcript_duplicates": tinfo.get("duplicates", 0),
             "plain_tokens": sum(plain), "ours_tokens": sum(ours),
             "plain_cost": round(price(plain, set()), 4),
@@ -1087,6 +1160,56 @@ def keepalive_line(rows: list[dict], ends) -> str:
             f"spent ${cost:,.2f}, saved ~${saved:,.2f} in rewrites")
 
 
+LIMITS = (20, 33, 49, 70, 100, 150, 200)
+
+
+def _usd(v: float) -> str:
+    return f"{'-' if v < 0 else '+'}${abs(v):,.2f}"
+
+
+def trims_lines(rows: list[dict], payback: float) -> list[str]:
+    """Why breaks did or didn't get a trim, what the trimmed part was made of, and which
+    warm payback limit would have paid best on this history (from each decision's `value`)."""
+    trims = [t for r in rows for t in r.get("trims") or []]
+    no_trim: dict[str, int] = {}
+    for r in rows:
+        for k, v in (r.get("no_trim") or {}).items():
+            no_trim[k] = no_trim.get(k, 0) + v
+    if not trims and not no_trim:
+        return []
+    applied = [t for t in trims if t["applied"]]
+    warm = [t for t in trims if not t["cold"] and t["s_new"] < t["s_now"]]
+    skipped_warm = [t for t in warm if not t["applied"]]
+    out = [f" trims at breaks: {len(trims)} priced, {len(applied)} applied "
+           f"({sum(t['cold'] for t in applied)} cold, {sum(not t['cold'] for t in applied)} warm); "
+           f"{len(skipped_warm)} warm skipped (pay back slower than {payback:g} requests), "
+           f"{sum(t['s_new'] >= t['s_now'] for t in trims)} not smaller"
+           + ("; no trim priced: " + ", ".join(f"{k} x{v}" for k, v in sorted(no_trim.items(), key=lambda kv: -kv[1]))
+              if no_trim else "")]
+    if warm:
+        def total(limit):
+            return sum(t["value"] for t in warm if t["reps"] <= limit)
+        best = max(LIMITS, key=lambda lim: (round(total(lim), 4), -abs(lim - payback)))   # ties: nearest today's
+        won = [t for t in skipped_warm if t["value"] > 0]
+        out.append(f" warm trims priced on what followed (estimate): applied ones "
+                   f"{_usd(sum(t['value'] for t in warm if t['applied']))}; "
+                   + (f"skipped ones would have made {_usd(sum(t['value'] for t in won))} ({len(won)}) and "
+                      f"{_usd(sum(t['value'] for t in skipped_warm if t['value'] <= 0))} "
+                      f"({len(skipped_warm) - len(won)}); " if skipped_warm else "")
+                   + f"best limit here {best} requests ({_usd(total(best) - total(payback))} vs {payback:g})")
+    parts: dict[str, int] = {}
+    for t in applied:
+        for k, v in (t.get("parts") or {}).items():
+            parts[k] = parts.get(k, 0) + v
+    if sum(parts.values()):
+        whole = sum(parts.values())
+        kept = sum(t.get("kept_chars") or 0 for t in applied)
+        out.append(" trimmed part (applied trims): " + ", ".join(
+            f"{k} {100 * v / whole:.0f}%" for k, v in sorted(parts.items(), key=lambda kv: -kv[1]))
+            + f"; the trim keeps {100 * kept / whole:.0f}% of its characters")
+    return out
+
+
 def rate_limit_warning(count) -> list[str]:
     """Counts estimated because Anthropic's rate limit was saturated: given up after waiting,
     or skipped while it was busy. Interpolated from the counts around them (the same as the
@@ -1287,6 +1410,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               cache_lifetime_line(ok, ttl_decision, main_ttl),
               measured_line(ok),
               *live_line(ok),
+              *trims_lines(ok, payback),
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
                  if count.errors else "")
