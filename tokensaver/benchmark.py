@@ -698,6 +698,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     ttls = cachettl.per_request(reqs)
     ours_ttls = [main_ttl] * len(reqs) if main_ttl else ttls
     expired = lambda k, gap, t=ttls: k > 0 and gap > cachettl.seconds(t[k - 1])
+    shared = cachettl.shared_prefix(reqs)      # still read at a miss (system prompt, tools)
     removed_at: dict[int, int] = {}
     sig_at: dict[int, int] = {}    # thinking signature chars TokenSaver removed (priced by `factor`)
     epochs: list[int] = []
@@ -911,7 +912,14 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         cost, prev = 0.0, None
         for k, (r, size, p) in enumerate(zip(reqs, sizes, prices)):
             gap = sim._ts(r.timestamp) - sim._ts(reqs[k - 1].timestamp) if k else 0
-            hit = 0 if prev is None or (expired(k, gap, t) and k not in warm) or k in rebuilt else min(prev, size)
+            # A session's first request reads what it really read (a resumed session finds its
+            # earlier cache); a miss or a trim's rewrite still reads the part shared across sessions.
+            if prev is None:
+                hit = min(r.read, size)
+            elif (expired(k, gap, t) and k not in warm) or k in rebuilt:
+                hit = min(shared, size)
+            else:
+                hit = min(prev, size)
             cost += (hit * p.read + (size - hit) * cachettl.write_price(p, t[k]) + r.out * p.out) / 1e6
             if parts is not None:              # the model's token split, to set beside the real one
                 parts["read"] = parts.get("read", 0) + hit

@@ -40,6 +40,21 @@ class CacheTtlTest(unittest.TestCase):
                          ["5m", "5m", "5m", "1h", "1h"], "carried forward; the start takes the first seen")
         self.assertEqual(cachettl.per_request([r(0, 0)]), ["1h"], "nothing reported: the default")
 
+    def test_shared_prefix(self):
+        stamp = lambda m: _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(1_800_000_000 + m * 60))
+        r = lambda m, read, ctx: NS(timestamp=stamp(m), read=read, context=ctx, write_5m=0, write_1h=ctx - read)
+        reqs = [r(0, 24_000, 80_000), r(1, 80_000, 82_000), r(100, 25_000, 90_000), r(101, 90_000, 91_000)]
+        self.assertEqual(cachettl.shared_prefix(reqs), 25_000, "median read at the first request and the 99-min gap")
+        resumed = [r(0, 70_000, 80_000), r(1, 80_000, 81_000)]
+        self.assertEqual(cachettl.shared_prefix(resumed), 0, "a first request reading most of it is a resume, not shared")
+        p = NS(read=0.2, write_1h=8.0, write_5m=5.0, out=0)
+        for x in reqs:
+            x.out = 0
+        cost = cachettl.price_history(reqs, p, "1h")
+        want = (24_000 * 0.2 + 56_000 * 8 + 80_000 * 0.2 + 2_000 * 8
+                + 25_000 * 0.2 + 65_000 * 8 + 90_000 * 0.2 + 1_000 * 8) / 1e6
+        self.assertAlmostEqual(cost, want, places=6)
+
     def test_prices(self):
         p = pricing.price_for("claude-sonnet-5-5")
         self.assertEqual(cachettl.write_price(p, "5m"), p.write_5m)

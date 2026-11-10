@@ -103,14 +103,35 @@ MIN_VERSION = (2, 1, 242)   # Claude Code that knows `promptCacheTtl`
 KEY = "promptCacheTtl"
 
 
-def price_history(reqs, p, ttl: str) -> float:
-    """One session's main requests with every cache entry at `ttl`: a request reads the
-    previous one's context if the gap is within the lifetime, else writes it all again."""
+def shared_prefix(reqs) -> int:
+    """Tokens a request still reads from cache when its own entry is gone: Claude Code's
+    system prompt and tools are the same across sessions, so their entry stays warm. The
+    median read on this session's real misses (its first request, and any request after
+    its entry expired that read under half its context); 0 when it has none. Measured
+    2026-11-10: a cost model writing everything again at a miss overcharged by 3% here
+    (median 24K still read) and ~9% on a machine with a 60K fixed part and short sessions."""
     from . import sim
-    cost, prev = 0.0, None
+    ttls, seen = per_request(reqs), []
     for k, r in enumerate(reqs):
         gap = sim._ts(r.timestamp) - sim._ts(reqs[k - 1].timestamp) if k else 0
-        hit = 0 if prev is None or gap > seconds(ttl) else min(prev, r.context)
+        if (k == 0 or gap > seconds(ttls[k - 1])) and r.read < 0.5 * r.context:
+            seen.append(r.read)
+    seen.sort()
+    return seen[len(seen) // 2] if seen else 0
+
+
+def price_history(reqs, p, ttl: str) -> float:
+    """One session's main requests with every cache entry at `ttl`: a request reads the
+    previous one's context if the gap is within the lifetime, else writes it all again
+    except the part shared across sessions (`shared_prefix`)."""
+    from . import sim
+    cost, prev, shared = 0.0, None, shared_prefix(reqs)
+    for k, r in enumerate(reqs):
+        gap = sim._ts(r.timestamp) - sim._ts(reqs[k - 1].timestamp) if k else 0
+        if prev is None:
+            hit = min(r.read, r.context)          # what the first request really read
+        else:
+            hit = min(shared, r.context) if gap > seconds(ttl) else min(prev, r.context)
         cost += (hit * p.read + (r.context - hit) * write_price(p, ttl) + r.out * p.out) / 1e6
         prev = r.context
     return cost

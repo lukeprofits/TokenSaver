@@ -122,6 +122,7 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
     last: dict = {}            # session -> (time, plain size, sent size) of its last main request
     ttl_of: dict = {}          # session -> cache lifetime of its last main request (`cachettl`)
     last_main_id: dict = {}
+    miss_read: dict = {}       # session -> what its last missed main request still read
     for ts, session, cls, u, rw, p, rid in reqs:
         inp = int(u.get("input_tokens") or 0)
         rd = int(u.get("cache_read_input_tokens") or 0)
@@ -173,10 +174,15 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
         if cls == "main":
             if warm and not (cause and not ours):
                 p_rd = min(prev[1], plain_size)
-            elif warm:
-                p_rd = 0.0                   # a rebuild plain Claude would have paid too
             else:
-                p_rd = 0.0
+                # A rebuild plain Claude Code would have paid too, or an expired cache: it still
+                # reads the part shared across sessions (system prompt, tools), not nothing
+                # (2026-11-10: that overstated the plain cost). This request's own read shows it
+                # when it missed; one that read most of it was kept warm by keep-alive, which
+                # plain Claude Code has not, so the session's last missed read stands in.
+                if rd < 0.5 * sent:
+                    miss_read[session] = rd
+                p_rd = min(miss_read.get(session, 0), plain_size)
             # Calibration: the same caching model on the sent sizes. It keeps
             # the real misses (there it uses the real read) and otherwise
             # assumes the previous request's prefix is read, as for plain.
