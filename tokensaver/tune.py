@@ -24,16 +24,13 @@ default rather than guessing:
   beats the current one by MIN_GAIN_PP, and hold if the last run picked a
   different best (two runs must agree before moving).
 
-`bg_warm_payback_max` is fitted too, more simply: a compaction applied while
-the cache is warm must repay its fresh write before the next free point (an
-expired cache or Claude Code's own compaction). How many requests a user makes
-after a 15-61 min break is a habit, measured here from their own history; the
-setting is that count's median (PAYBACK_QUANTILE). Measured 2026-11-10 with the
-benchmark's priced warm trims (each one's gain or loss on the requests that really
-followed), 30 days here: limit 33 +$22.8, 49 (the p40 fit then) +$25.4, 70 +$28.2,
-100 +$16.4, none -$41.6. The mean is the textbook rule but rare long runs pull it up, and
-too high a limit loses fast; the median sits near the best value. Same insufficiency
-rules (MIN_MOMENTS, MIN_SESSIONS_WITH), clamped to bounds, never over a user value, and moved only on a change of over 20%.
+`bg_warm_payback_max` is not fitted (2026-11-10): it stays at its default, and a
+value an earlier version fitted is removed. A per-user count of requests after a break
+(p40, then the median) measured worse than the default: priced on what really followed
+each warm trim, 30 days here, limit 33 +$22.8, 43 (the median) ~+$24, 49 (the p40 fit)
++$25.4, 70 +$28.2, 100 +$16.4, none -$41.6. A count is a poor stand-in for money, and it
+left out sessions that went through TokenSaver. The benchmark's "best limit here" line
+prices the limits on each machine; per-user fitting comes back only if those disagree.
 
 Local only: replays transcripts on disk, no API calls.
 """
@@ -43,7 +40,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from . import background, cachettl, config, sim, vault
+from . import background, config, sim, vault
 
 CANDIDATES = (10.0, 15.0, 20.0, 30.0, 45.0, 61.0)
 MIN_AUDITED = 20
@@ -52,8 +49,6 @@ MIN_DAYS = 7
 MIN_MOMENTS = 15
 MIN_SESSIONS_WITH = 5
 MIN_GAIN_PP = 1.0
-PAYBACK_QUANTILE = 0.5
-PAYBACK_MIN_CHANGE = 0.2
 
 
 @dataclass
@@ -120,52 +115,17 @@ def _pass_rate() -> tuple[float, str]:
     return 1.0, "rules-only compaction applies without a check"
 
 
-def remaining_after_breaks(data: list, min_tokens: int | None) -> tuple[list[int], int]:
-    """For each warm break (15-61 min idle, context over `min_tokens`): how many
-    requests followed before the next free point (gap over the TTL, or the
-    context halving: Claude Code compacted). Also how many sessions had one."""
-    out, with_one = [], 0
-    for d in data:
-        rq = d.requests
-        ts = [sim._ts(r.timestamp) for r in rq]
-        exp = [cachettl.seconds(t) + 60 for t in cachettl.per_request(rq)]   # entry lifetime
-        had = False
-        for i in range(1, len(rq)):
-            if not (15 * 60 < ts[i] - ts[i - 1] <= exp[i - 1] and rq[i].context > sim.threshold(d, min_tokens)):
-                continue
-            n = 0
-            for j in range(i + 1, len(rq)):
-                if ts[j] - ts[j - 1] > exp[j - 1] or rq[j].context < 0.5 * rq[j - 1].context:
-                    break
-                n += 1
-            out.append(n)
-            had = True
-        with_one += had
-    return sorted(out), with_one
-
-
-def decide_payback(remaining: list[int], sessions_with: int, current: float, default: float) -> Decision:
-    """Pure: the warm-apply payback limit from measured remaining requests."""
-    if len(remaining) < MIN_MOMENTS or sessions_with < MIN_SESSIONS_WITH:
-        return Decision(default, "default", f"too few warm breaks to fit ({len(remaining)} in "
-                                            f"{sessions_with} sessions)")
-    spec = config.SPECS["bg_warm_payback_max"]
-    q = float(remaining[int(PAYBACK_QUANTILE * len(remaining))])
-    value = config.clamp(spec, q)
-    if current and abs(value - current) <= PAYBACK_MIN_CHANGE * current:
-        return Decision(current, "held", f"median requests after a break is {q:g}; within 20% of {current:g}")
-    return Decision(value, "tuned", f"median requests after a break is {q:g} "
-                                    f"({len(remaining)} breaks in {sessions_with} sessions)")
-
-
 def run(apply: bool = True, force: bool = False) -> Decision:
+    payback = _payback(apply)
     default = config.SPECS["bg_after_min"].default
     current, source = config.resolve("bg_after_min")
     if source in ("user", "env"):
-        return Decision(current, "user", f"you set bg_after_min yourself ({source}); not tuning it")
+        return Decision(current, "user", f"you set bg_after_min yourself ({source}); not tuning it",
+                        payback=payback)
     audited = _audited()
     if audited < MIN_AUDITED and not force:
-        d = Decision(current, "held", f"waiting for real token data: {audited}/{MIN_AUDITED} audited requests")
+        d = Decision(current, "held", f"waiting for real token data: {audited}/{MIN_AUDITED} audited requests",
+                     payback=payback)
         _record(d, apply)
         return d
     data = sim.sessions()
@@ -203,17 +163,20 @@ def run(apply: bool = True, force: bool = False) -> Decision:
         config.set_value("bg_prep_idle_min", max(5.0, min(10.0, d.value - 4)), "tuned",
                          why=f"derived from bg_after_min={d.value:g}")
     _record(d, apply, best=best_now)
-    pb_current, pb_source = config.resolve("bg_warm_payback_max")
-    if pb_source in ("user", "env"):
-        d.payback = Decision(pb_current, "user", "you set bg_warm_payback_max yourself; not tuning it")
-    else:
-        remaining, with_one = remaining_after_breaks(data, min_tokens)
-        d.payback = decide_payback(remaining, with_one, pb_current,
-                                   config.SPECS["bg_warm_payback_max"].default)
-        if apply and d.payback.source == "tuned":
-            config.set_value("bg_warm_payback_max", d.payback.value, "tuned", why=d.payback.why,
-                             evidence={"breaks": len(remaining), "sessions": with_one})
+    d.payback = payback
     return d
+
+
+def _payback(apply: bool) -> Decision:
+    """The warm payback limit: the user's own value, else the default; a value an earlier
+    version fitted is removed (see the module docstring)."""
+    value, source = config.resolve("bg_warm_payback_max")
+    if source in ("user", "env"):
+        return Decision(value, "user", "you set bg_warm_payback_max yourself")
+    if apply and source == "tuned":
+        config.unset("bg_warm_payback_max", "tuned")
+    return Decision(config.SPECS["bg_warm_payback_max"].default, "default",
+                    "not fitted per user; the default paid best on real trims")
 
 
 def _record(d: Decision, apply: bool, best: float | None = None) -> None:

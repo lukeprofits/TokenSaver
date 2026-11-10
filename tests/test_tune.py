@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tokensaver import tune  # noqa: E402
+from tokensaver import config, tune  # noqa: E402
 
 OK = {"sessions": 50, "days": 30, "moments": 40, "sessions_with": 12}
 WIN = {10.0: 30.0, 15.0: 27.0, 20.0: 25.0, 30.0: 23.0, 45.0: 19.0, 61.0: 16.0}
@@ -53,23 +53,30 @@ class DecideTest(unittest.TestCase):
 
 
 class PaybackTest(unittest.TestCase):
-    """tune.decide_payback: the warm-apply limit from requests made after breaks."""
+    """bg_warm_payback_max is not fitted: the default, a user's own value, and an earlier
+    version's fitted value removed."""
 
-    def test_too_few_breaks_is_default(self):
-        r = tune.decide_payback([50] * 5, 2, 70.0, 70.0)
-        self.assertEqual((r.value, r.source), (70.0, "default"))
+    def test_fitted_value_is_removed(self):
+        config.set_value("bg_warm_payback_max", 49.0, "tuned")
+        self.assertEqual(config.resolve("bg_warm_payback_max"), (49.0, "tuned"))
+        d = tune._payback(apply=True)
+        self.assertEqual((d.value, d.source), (70.0, "default"))
+        self.assertEqual(config.resolve("bg_warm_payback_max"), (70.0, "default"))
 
-    def test_fits_the_median_and_clamps(self):
-        r = tune.decide_payback(sorted(range(0, 300, 10)), 8, 70.0, 70.0)
-        self.assertEqual((r.value, r.source), (150.0, "tuned"))
-        r = tune.decide_payback([1000] * 30, 8, 70.0, 70.0)
-        self.assertEqual(r.value, 200.0, "clamped to the setting's upper bound")
-        r = tune.decide_payback([1] * 30, 8, 70.0, 70.0)
-        self.assertEqual(r.value, 20.0, "clamped to the lower bound")
+    def test_dry_run_leaves_it(self):
+        config.set_value("bg_warm_payback_max", 49.0, "tuned")
+        tune._payback(apply=False)
+        self.assertEqual(config.resolve("bg_warm_payback_max"), (49.0, "tuned"))
 
-    def test_small_change_holds(self):
-        r = tune.decide_payback([75] * 30, 8, 70.0, 70.0)
-        self.assertEqual((r.value, r.source), (70.0, "held"))
+    def test_user_value_kept(self):
+        config.set_value("bg_warm_payback_max", 40.0, "user")
+        d = tune._payback(apply=True)
+        self.assertEqual((d.value, d.source), (40.0, "user"))
+        self.assertEqual(config.resolve("bg_warm_payback_max"), (40.0, "user"))
+
+    def tearDown(self):
+        for src in ("tuned", "user"):
+            config.unset("bg_warm_payback_max", src)
 
 
 class SimRulesTest(unittest.TestCase):
