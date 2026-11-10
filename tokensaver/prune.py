@@ -496,6 +496,7 @@ def run_stage(messages: list, cut: int, stage: str, *, judge_model: str, min_p: 
             elif yielder.step() != "go":
                 stopped.append("machine strained")
             return bool(stopped)
+        info["spotted"] = True                  # the spotter ran (heavy work), even if it stops
         proposed = spot(ps, bg.LOCAL_MODEL, should_stop=should_stop)
         remember_size(bg.LOCAL_MODEL)
         unload(bg.LOCAL_MODEL)

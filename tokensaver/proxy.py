@@ -436,7 +436,7 @@ def _prune_step(session: str, live: dict) -> bool:
                 if not ok:
                     vault.record("bg_prune", tool="proxy", session_id=session, index=False,
                                  summary=f"lines stage paused: {why}", meta={"stage": stage, "stopped": why})
-                    return True
+                    return False            # nothing ran: see below
                 shrink, info = _line_picks(session, messages, cut)
                 if info.get("stopped"):
                     prune.unload(background.LOCAL_MODEL)
@@ -452,7 +452,12 @@ def _prune_step(session: str, live: dict) -> bool:
                 if drop is None:
                     vault.record("bg_prune", tool="proxy", session_id=session, index=False,
                                  summary=f"{stage} stage paused: {info.get('stopped')}", meta=info)
-                    return True
+                    # Heavy work only if a model actually ran. A stage that could not even load
+                    # (too little free memory) did none; returning True there made the worker end
+                    # its round at this session every 30 s, so neither it nor any session after it
+                    # was ever prepared again: live trims stayed at a stale, small cut for days
+                    # (2026-11-06: 38K prepared, session at 216K, 4 breaks skipped as worthless).
+                    return bool(info.get("judged") or info.get("spotted"))
                 res, _ = background._extract(messages, cut, drop)
             better = res["new_tokens"] < before
             if better:

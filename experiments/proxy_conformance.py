@@ -876,6 +876,15 @@ def main() -> int:
         got = run("s18e", 4)[-1]
         check("a strained machine pauses the lines stage", got["text"] == "RULES-ONLY" and not got.get("prune_done")
               and (got.get("pruned") or {}).get("tried") == "deep", "half-picked text would be applied")
+        proxy.prune.run_stage = lambda *a, **k: (None, {"stopped": "spotter: needs 29 GB", "judged": 0})
+        proxy._bg_save("s18g", {"pending": dict(pend)})
+        check("a stage that could not load did no heavy work (the worker goes on to prepare)",
+              not proxy._prune_step("s18g", live),
+              "the worker ended every round here: this session was never prepared again (2026-11-06)")
+        proxy.prune.run_stage = lambda *a, **k: (None, {"stopped": "out of time", "judged": 3})
+        proxy._bg_save("s18h", {"pending": dict(pend)})
+        check("a stage that ran and stopped part-way did heavy work", proxy._prune_step("s18h", live),
+              "two heavy steps could run in one round")
         proxy.prune.tier = lambda: ("off", "test")
         proxy._bg_save("s18f", {"pending": dict(pend)})
         check("prune off: nothing runs", not proxy._prune_step("s18f", live), "the switch must work")
