@@ -65,6 +65,33 @@ def _write_settings(data: dict) -> None:
     claude_settings.write_json(SETTINGS, data)
 
 
+def cache_ttl_step() -> Step:
+    """The main conversation's cache lifetime, from this user's own history (`cachettl`)."""
+    from . import cachettl
+    if _read_settings() is None:
+        return Step("cache", "skip", f"{SETTINGS} does not parse; not touching it")
+    v, ours = cachettl.current()
+    st = cachettl.load_state()
+    if v is not None and not ours:
+        return Step("cache", "already", f"cache lifetime: your own {cachettl.KEY} {v!r} stays")
+    if st.get("mode") == "off":
+        return Step("cache", "skip", "cache lifetime: left to Claude Code (`tokensaver cache-ttl off`)")
+    if ours:
+        return Step("cache", "already", "cache lifetime: 1 hour for the main conversation (set by TokenSaver)")
+    d = cachettl.choose()
+    if not d["set"] and st.get("mode") != "on":
+        return Step("cache", "already", f"cache lifetime: Claude Code's default ({d['why']}); "
+                                        "re-checked weekly")
+    return Step("cache", "todo", f"1-hour cache for the main conversation ({cachettl.KEY} in {SETTINGS}): "
+                + d["why"], lambda: cachettl.apply(d),
+                ["a 1-hour cache write costs 2x the input price (5 minutes: 1.25x); it pays when you pause "
+                 "5-60 minutes on a big conversation, as your history shows",
+                 "subagents keep 5 minutes; open sessions write their cache once more when it changes",
+                 "with 1 hour, Claude Code also compacts an idle 200K+ conversation itself after ~55 minutes "
+                 "(its `idleCompaction` setting)",
+                 "re-checked weekly; `tokensaver cache-ttl off` takes it out"])
+
+
 def statusline_step(mode: str) -> Step:
     data = _read_settings()
     if data is None:
@@ -415,6 +442,7 @@ def plan(route: str = "settings", shell_rc: str = "yes", audit: str | None = Non
     if old:
         steps.append(old)
     steps.append(statusline_step(statusbar))
+    steps.append(cache_ttl_step())
     steps.append(Step("verify", "todo", "conformance suite (local, free) and the live health check",
                       lambda: verify(route)))
     return steps
@@ -634,6 +662,8 @@ def uninstall(purge: bool | None = None, yes: bool = False) -> int:
 
     step("update entries written before the rename", lambda: (migrate.rewrite_names(), None)[1])
     step("take routing out of settings.json", routing_off)
+    from . import cachettl
+    step("take the 1-hour cache setting out of settings.json", cachettl.remove)
     step("stop and remove the service", svc.remove)
     from . import localai
     pulled_into_theirs = [] if localai.DIR.exists() else localai.load_state().get("pulled") or []

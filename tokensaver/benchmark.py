@@ -634,7 +634,8 @@ def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict
 # ---- one session ----------------------------------------------------------------
 
 def replay(d, count: Counter, step: int, after_s: float, payback: float, factor: float,
-           transform=None, prune=None, keepalive_ends: dict | None = None) -> dict:
+           transform=None, prune=None, keepalive_ends: dict | None = None,
+           main_ttl: str | None = None) -> dict:
     """One session. `transform(k, hist) -> messages` replaces tokensaver's
     rewrite with another tool's (experiments use it for Headroom); then no
     compaction is emulated. `prune(cand, hist) -> cand` (`--benchmark full`)
@@ -643,7 +644,10 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     `keepalive_ends` (the user's day ends): cache keep-alive replayed with the
     proxy's own rule (`keepalive.replay_bumps`): a break kept warm is priced as a
     cache read and its trim decided as on a warm return; every bump is paid for,
-    including after a session's last request, where nobody came back."""
+    including after a session's last request, where nobody came back.
+    `main_ttl` ("1h"): the cache lifetime TokenSaver sets for the main conversation
+    (`cachettl.choose`); the TokenSaver side is priced and decided with it, plain Claude Code
+    keeps the lifetime each request really had."""
     from . import keepalive as ka
     kept_warm: set[int] = set()
     bump_events: list[tuple[int, int]] = []     # (request the bumps followed, how many)
@@ -661,7 +665,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     # Each request's cache lifetime, from what its usage says it wrote (`cachettl`): a request
     # reads the previous one's entry while the gap is within that entry's lifetime.
     ttls = cachettl.per_request(reqs)
-    expired = lambda k, gap: k > 0 and gap > cachettl.seconds(ttls[k - 1])
+    ours_ttls = [main_ttl] * len(reqs) if main_ttl else ttls
+    expired = lambda k, gap, t=ttls: k > 0 and gap > cachettl.seconds(t[k - 1])
     removed_at: dict[int, int] = {}
     sig_at: dict[int, int] = {}    # thinking signature chars TokenSaver removed (priced by `factor`)
     epochs: list[int] = []
@@ -731,11 +736,11 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                         floor = (floor_now() or 0) if through else max(r.context - n_now, 0)
                         s_now, s_new = n_now + floor, n_new + floor
                         p = prices[k]
-                        w = cachettl.write_price(p, ttls[k])
+                        w = cachettl.write_price(p, ours_ttls[k])
                         reps = (s_new * w - s_now * p.read) / max((s_now - s_new) * p.read, 1)
                         decided = (cand, s_now, s_new, reps)
-            cold = expired(k, gap)
-            if keepalive_ends is not None and k and ttls[k - 1] == "1h":   # live: 1-hour caches only
+            cold = expired(k, gap, ours_ttls)
+            if keepalive_ends is not None and k and ours_ttls[k - 1] == "1h":   # live: 1-hour caches only
                 # The break before this request: would keep-alive have kept the cache, and at what cost?
                 big = k >= ka.BIG_REQUESTS or returned or reqs[k - 1].context >= ka.BIG_TOKENS
                 warm_trim = decided is not None and decided[2] < decided[1] and decided[3] <= payback
@@ -794,7 +799,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
 
     rem, sig_rem = fill(removed_at), fill(sig_at)
 
-    if keepalive_ends is not None and transform is None and ttls[-1] == "1h" \
+    if keepalive_ends is not None and transform is None and ours_ttls[-1] == "1h" \
             and not ka.closed_by_user(d.session.path):
         # After the session's last request: bumps for someone who never came back (as it runs
         # live while the session stays open; a /clear or /exit closed it, so none then).
@@ -805,12 +810,12 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         if n:
             bump_events.append((last, n))
 
-    def price(sizes, rebuilt, warm=frozenset(), bumps=()) -> float:
+    def price(sizes, rebuilt, warm=frozenset(), bumps=(), t=ttls) -> float:
         cost, prev = 0.0, None
         for k, (r, size, p) in enumerate(zip(reqs, sizes, prices)):
             gap = sim._ts(r.timestamp) - sim._ts(reqs[k - 1].timestamp) if k else 0
-            hit = 0 if prev is None or (expired(k, gap) and k not in warm) or k in rebuilt else min(prev, size)
-            cost += (hit * p.read + (size - hit) * cachettl.write_price(p, ttls[k]) + r.out * p.out) / 1e6
+            hit = 0 if prev is None or (expired(k, gap, t) and k not in warm) or k in rebuilt else min(prev, size)
+            cost += (hit * p.read + (size - hit) * cachettl.write_price(p, t[k]) + r.out * p.out) / 1e6
             prev = size
         # a bump reads the context its session had then
         return cost + sum(n * sizes[i] * prices[i].read / 1e6 for i, n in bumps)
@@ -841,9 +846,11 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             "transcript_duplicates": tinfo.get("duplicates", 0),
             "plain_tokens": sum(plain), "ours_tokens": sum(ours),
             "plain_cost": round(price(plain, set()), 4),
-            "ours_cost": round(price(ours, rebuilt, kept_warm, bump_events), 4),
-            "ours_cost_factor_lo": round(price(ours_lo, rebuilt, kept_warm, bump_events), 4),
-            "ours_cost_factor_hi": round(price(ours_hi, rebuilt, kept_warm, bump_events), 4),
+            "ours_cost": round(price(ours, rebuilt, kept_warm, bump_events, ours_ttls), 4),
+            "ours_cost_factor_lo": round(price(ours_lo, rebuilt, kept_warm, bump_events, ours_ttls), 4),
+            "ours_cost_factor_hi": round(price(ours_hi, rebuilt, kept_warm, bump_events, ours_ttls), 4),
+            # plain Claude Code with only the cache lifetime changed: that part of the saving
+            "plain_cost_ours_ttl": round(price(plain, set(), t=ours_ttls), 4),
             "keepalive_bumps": sum(n for _, n in bump_events), "keepalive_kept": len(kept_warm),
             "keepalive_cost": round(bump_cost, 4), "keepalive_saved": round(kept_saved, 4),
             "thinking_chars_removed": sum(sig_rem), "real_cost": round(real, 4),
@@ -931,14 +938,22 @@ def measured_line(rows: list[dict]) -> str:
             f"{_pct(ours, plain):.1f}% cheaper")
 
 
-def cache_lifetime_line(rows: list[dict]) -> str:
-    """Which cache lifetime the sessions used (each request is priced by its own)."""
+def cache_lifetime_line(rows: list[dict], decision: dict | None = None, main_ttl: str | None = None) -> str:
+    """Which cache lifetime the sessions used (plain is priced by each request's own), and what
+    TokenSaver's choice for the main conversation is worth."""
     short = sum(1 for r in rows if r.get("write_5m_tokens", 0) > r.get("write_1h_tokens", 0))
-    if not short:
-        return " cache lifetime: 1 hour"
-    return (f" cache lifetime: 5 minutes on {short} of {len(rows)} sessions (Claude Code uses 1 hour only "
-            "for a Claude subscription login outside extra usage, or with ENABLE_PROMPT_CACHING_1H=1); "
-            "keep-alive needs 1 hour, so it is left out there")
+    ran = (f"5 minutes on {short} of {len(rows)} sessions (Claude Code uses 1 hour only for a Claude "
+           "subscription within its plan's usage)") if short else "1 hour"
+    acc = f"; the cache model predicted {100 * decision['accuracy']:.0f}% of real cache reads" \
+        if decision and decision.get("accuracy") is not None else ""
+    if main_ttl != "1h" or not short:
+        why = f"; TokenSaver leaves it ({decision['why']})" if decision and short else ""
+        return f" cache lifetime: {ran}{why}{acc}"
+    plain = sum(r.get("plain_cost", 0) for r in rows)
+    with_1h = sum(r.get("plain_cost_ours_ttl", r.get("plain_cost", 0)) for r in rows)
+    return (f" cache lifetime: {ran}; TokenSaver sets 1 hour for the main conversation (included above): "
+            f"${plain:,.2f} -> ${with_1h:,.2f} on its own, and keep-alive then applies"
+            f"{acc}; chosen on this same history")
 
 
 def keepalive_line(rows: list[dict], ends) -> str:
@@ -1088,6 +1103,14 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         ka_ends = ka.day_ends([sim._ts(r.timestamp) for d in data
                                if ka.interactive(f"(external, {ka._entrypoint(d.session.path) or 'cli'})")
                                for r in d.requests])
+    # The main conversation's cache lifetime as TokenSaver would set it here (`cachettl`):
+    # 1 hour where this user's history shows it is cheaper, unless they set it themselves.
+    ttl_now, ttl_ours = cachettl.current()
+    ttl_decision = cachettl.choose()
+    main_ttl = None
+    if (ttl_now is None or ttl_ours) and cachettl.load_state().get("mode") != "off" \
+            and (ttl_decision["set"] or cachettl.load_state().get("mode") == "on"):
+        main_ttl = "1h"
     pruner = None
     if mode == "full":
         import tempfile
@@ -1118,7 +1141,8 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         t = time.time()
         repaired_before = sum(count.repairs.values())
         try:
-            r = replay(d, count, step, after_s, payback, f, prune=pruner, keepalive_ends=ka_ends)
+            r = replay(d, count, step, after_s, payback, f, prune=pruner, keepalive_ends=ka_ends,
+                       main_ttl=main_ttl)
         except Exception as exc:
             r = {"skipped": f"{type(exc).__name__}"}
         if sum(count.repairs.values()) > repaired_before:
@@ -1140,7 +1164,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
                     "without local AI: `--benchmark full` includes it):")]
     lines += summarize(rows)
     lines += [f" cost model check (sessions without TokenSaver): plain modelled ${pc:,.2f} vs your real bill ${rc:,.2f}",
-              cache_lifetime_line(ok),
+              cache_lifetime_line(ok, ttl_decision, main_ttl),
               measured_line(ok),
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
@@ -1165,6 +1189,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
     print("\n".join(lines))
     report = {"tokensaver": __version__, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "step": step, "mode": mode,
               "settings": {"bg_after_min": after_s / 60, "bg_warm_payback_max": payback},
+              "cache_ttl": {"main_ttl": main_ttl, **ttl_decision},
               "thinking_factors": factors,
               "counts": {"calls": count.calls, "failed": count.failed, "rate_limited": count.rate_limited,
                          "attempts": count.attempts, "repairs": count.repairs,

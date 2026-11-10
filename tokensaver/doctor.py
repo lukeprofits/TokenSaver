@@ -221,6 +221,8 @@ def _proxy_lines() -> list[str]:
         from . import keepalive, localai
         L.append(f"    local AI: {localai.describe()} (setting {config.get('local_ai')})")
         L.append(f"    cache keep-alive: {keepalive.describe()} (setting {config.get('cache_keepalive')})")
+        from . import cachettl
+        L.append(f"    cache lifetime: {cachettl.describe()}")
         L.append(f"    smart prune: tier {t} ({why}); judge {config.get('prune_judge')} "
                  f"{'installed' if prune._name(config.get('prune_judge'), inst) else 'NOT installed'}, "
                  f"delete at p >= {config.get('prune_min_p')}")

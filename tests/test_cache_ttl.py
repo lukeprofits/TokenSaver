@@ -181,5 +181,142 @@ class ProxyTtlTest(unittest.TestCase):
                         "negative control: on a 1h cache the same reads are misses")
 
 
+def _history(root: Path, sessions: int, n: int, gap_min: float, ctx: int, ttl: str = "5m"):
+    """`sessions` transcripts of `n` requests, context growing 2K per request, `gap_min` apart."""
+    key = "ephemeral_1h_input_tokens" if ttl == "1h" else "ephemeral_5m_input_tokens"
+    t = _t.mktime((2026, 10, 20, 9, 0, 0, 0, 0, -1))
+    for s in range(sessions):
+        rows = []
+        for i in range(n):
+            t += gap_min * 60
+            stamp = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(t))
+            size = ctx + 2000 * i
+            rows.append({"type": "user", "uuid": f"u{s}-{i}", "timestamp": stamp,
+                         "message": {"role": "user", "content": f"step {s} {i}"}})
+            rows.append({"type": "assistant", "uuid": f"a{s}-{i}", "timestamp": stamp, "message": {
+                "id": f"m{s}-{i}", "role": "assistant", "model": "claude-sonnet-5-5",
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 2, "cache_read_input_tokens": size - 2002 if i else 0,
+                          "output_tokens": 10, "cache_creation_input_tokens": 2000 if i else size - 2,
+                          "cache_creation": {key: 2000 if i else size - 2}}}})
+        d = root / "proj"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"s{s}.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    return t
+
+
+class ChooseTest(unittest.TestCase):
+    def choose(self, *a, **k):
+        root = Path(tempfile.mkdtemp())
+        end = _history(root, *a, **k)
+        return cachettl.choose(root=root, now=end + 86400)
+
+    def test_bursty_short_sessions_leave_claude_codes_default(self):
+        d = self.choose(6, 15, 1, 50_000)
+        self.assertFalse(d["set"], d["why"])
+        self.assertLess(d["cost_5m"], d["cost_1h"])
+
+    def test_pauses_on_big_contexts_set_1h(self):
+        d = self.choose(6, 15, 20, 200_000)
+        self.assertTrue(d["set"], d["why"])
+        self.assertLess(d["cost_1h"], d["cost_5m"])
+
+    def test_thin_history_defaults_to_1h(self):
+        d = self.choose(2, 15, 1, 50_000)
+        self.assertTrue(d["set"])
+        self.assertIn("only 2 sessions", d["why"])
+
+    def test_model_accuracy_against_real_reads(self):
+        root = Path(tempfile.mkdtemp())
+        end = _history(root, 6, 15, 1, 50_000)            # every read is real and the model agrees
+        self.assertEqual(cachettl.choose(root=root, now=end + 86400)["accuracy"], 1.0)
+
+
+class SettingTest(unittest.TestCase):
+    def setUp(self):
+        from tokensaver import claude_settings
+        self.path = claude_settings.SETTINGS
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for p in (self.path, cachettl._state_path()):
+            self.addCleanup(lambda p=p: p.exists() and p.unlink())
+        self.decision = {"set": True, "cost_1h": 1.0, "cost_5m": 2.0, "why": "test"}
+
+    def write(self, data):
+        self.path.write_text(json.dumps(data) if not isinstance(data, str) else data)
+
+    def read(self):
+        return json.loads(self.path.read_text())
+
+    def test_apply_keeps_other_keys_and_remove_takes_only_ours(self):
+        self.write({"model": "opus", "env": {"A": "1"}})
+        cachettl.apply(self.decision, backup=False)
+        self.assertEqual(self.read(), {"model": "opus", "env": {"A": "1"}, "promptCacheTtl": "1h"})
+        self.assertEqual(cachettl.current(), ("1h", True))
+        cachettl.remove(backup=False)
+        self.assertEqual(self.read(), {"model": "opus", "env": {"A": "1"}})
+
+    def test_a_users_own_value_is_never_touched(self):
+        self.write({"promptCacheTtl": "5m"})
+        self.assertIn("left alone", cachettl.apply(self.decision, backup=False))
+        self.assertEqual(self.read(), {"promptCacheTtl": "5m"})
+        self.assertIsNone(cachettl.remove(backup=False))
+        self.assertEqual(self.read(), {"promptCacheTtl": "5m"})
+
+    def test_a_value_changed_since_stays(self):
+        self.write({})
+        cachettl.apply(self.decision, backup=False)
+        self.write({"promptCacheTtl": "5m"})                 # the user changed it afterwards
+        cachettl.remove(backup=False)
+        self.assertEqual(self.read(), {"promptCacheTtl": "5m"})
+
+    def test_unparseable_file_untouched(self):
+        self.write("{not json")
+        with self.assertRaises(RuntimeError):
+            cachettl.apply(self.decision, backup=False)
+        self.assertEqual(self.path.read_text(), "{not json")
+
+    def test_recheck_flips_only_past_the_band_twice_running(self):
+        self.write({})
+        cachettl.apply(self.decision, backup=False)
+        now = [2_000_000_000.0]
+        cheap5 = {"set": False, "cost_1h": 100.0, "cost_5m": 85.0, "sessions": 9, "accuracy": 1.0, "why": "x"}
+        close = dict(cheap5, cost_5m=95.0)
+        for d, removed in ((close, False), (cheap5, False), (close, False), (cheap5, False), (cheap5, True)):
+            now[0] += cachettl.RECHECK_S + 1
+            with mock.patch.object(cachettl, "choose", lambda **k: d):
+                cachettl.recheck(now=now[0])
+            self.assertEqual("promptCacheTtl" not in self.read(), removed, (d, removed))
+
+    def test_off_sticks(self):
+        self.write({})
+        cachettl.apply(self.decision, backup=False)
+        with mock.patch.object(cachettl, "choose", lambda **k: self.decision):
+            cachettl.set_mode("off")
+            self.assertEqual(self.read(), {})
+            self.assertIsNone(cachettl.recheck(now=_t.time() + 30 * 86400))
+        self.assertEqual(self.read(), {})
+
+
+class BenchmarkMainTtlTest(unittest.TestCase):
+    def setUp(self):
+        from tokensaver import keepalive as ka
+        p = mock.patch.object(ka, "idle_compact_at", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_ours_priced_at_1h_plain_unchanged(self):
+        d = _session("5m", {10: 20, 20: 40})                 # pauses a 5m cache does not survive
+        base = benchmark.replay(d, COUNT, 8, 900, 70, 0.264)
+        with1h = benchmark.replay(d, COUNT, 8, 900, 70, 0.264, main_ttl="1h")
+        self.assertEqual(with1h["plain_cost"], base["plain_cost"], "plain keeps the lifetime it ran")
+        self.assertLess(with1h["plain_cost_ours_ttl"], with1h["plain_cost"], "1h survives the pauses")
+        self.assertLess(with1h["ours_cost"], base["ours_cost"])
+
+    def test_keepalive_follows_ours(self):
+        d = _session("5m", {15: 90})
+        on = benchmark.replay(d, COUNT, 8, 900, 70, 0.264, keepalive_ends=_ends(), main_ttl="1h")
+        self.assertGreater(on["keepalive_bumps"], 0, "with 1h set, keep-alive runs on this session")
+
+
 if __name__ == "__main__":
     unittest.main()

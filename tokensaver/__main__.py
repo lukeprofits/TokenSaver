@@ -32,6 +32,11 @@ Cache keep-alive (a cheap read keeps Claude's cache alive through a daytime brea
   tokensaver keepalive     what it is doing and what it saved and spent
   tokensaver keepalive off never; `auto` (the default: once it has learned your usual hours) or `on`
 
+Cache lifetime (how long Claude keeps your conversation cached between messages):
+  tokensaver cache-ttl     what it is and why, from your own history
+  tokensaver cache-ttl off leave it to Claude Code; `auto` (the default: 1 hour where your history
+                           shows it is cheaper) or `on` (always 1 hour)
+
 Checking and numbers:
   tokensaver doctor        is it installed and working?
   tokensaver proxy --stats what it has saved so far
@@ -76,6 +81,11 @@ def _toggle(cmd: str) -> int:
         try:
             from . import keepalive
             print(f"cache keep-alive: {keepalive.describe()}")
+        except Exception:
+            pass
+        try:
+            from . import cachettl
+            print(f"cache lifetime: {cachettl.describe()}")
         except Exception:
             pass
         return 0
@@ -197,6 +207,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("update", help="pull the latest TokenSaver and restart the proxy")
     p_ka = sub.add_parser("keepalive", help="keep the cache warm through daytime breaks: show, or set auto | on | off")
     p_ka.add_argument("mode", nargs="?", choices=("auto", "on", "off"))
+    p_ct = sub.add_parser("cache-ttl", help="the main conversation's cache lifetime: show, or set auto | on | off")
+    p_ct.add_argument("mode", nargs="?", choices=("auto", "on", "off"))
     p_ai = sub.add_parser("local-ai", help="local models for break-time trimming: show, or set auto | on | off")
     p_ai.add_argument("mode", nargs="?", choices=("auto", "on", "off"))
     p_ai.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)      # the background download
@@ -255,6 +267,13 @@ def main(argv: list[str] | None = None) -> int:
                 keepalive._save_state(st)
         print(f"cache keep-alive: {keepalive.describe()}  (`tokensaver keepalive auto|on|off`; "
               "takes effect within a minute, no restart)")
+        return 0
+    if args.cmd == "cache-ttl":
+        from . import cachettl
+        if args.mode:
+            print(cachettl.set_mode(args.mode))
+        print(f"cache lifetime: {cachettl.describe()}  (`tokensaver cache-ttl auto|on|off`; "
+              "Claude Code picks it up on its next request)")
         return 0
     if args.cmd == "local-ai":
         from . import localai

@@ -109,6 +109,15 @@ def once(check=healthy) -> str:
     except Exception:
         pass
     try:
+        # The main conversation's cache lifetime, re-checked weekly from the transcripts.
+        if routing.state().get("managed"):
+            from . import cachettl
+            did = cachettl.recheck()
+            if did:
+                vault.record("cache_ttl", tool="watchdog", index=False, summary=did)
+    except Exception:
+        pass
+    try:
         rs = routing.state()
         if not rs.get("managed"):
             return "not managing routing"
