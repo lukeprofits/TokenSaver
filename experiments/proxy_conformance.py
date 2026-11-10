@@ -518,6 +518,25 @@ def main() -> int:
         proxy._LIVE.pop("sess-bg7", None)
         check("warm cache with no payback estimate: not applied",
               len(bg_post(hist, "sess-bg7")) == len(hist), "a guess instead of a measurement")
+        # A 5-minute cache (an API key; Claude Code's markers carry no ttl): the same 20-minute
+        # break is cold, so the prepared compaction applies with no payback test. Negative
+        # control: the same break on a 1-hour cache stays warm (above).
+        marked = hist[:-1] + [{"role": "user", "content": [
+            {"type": "text", "text": "the newest request", "cache_control": {"type": "ephemeral"}}]}]
+        for sess, ttl, want in (("sess-ttl5", "5m", True), ("sess-ttl1", "1h", False)):
+            proxy._bg_save(sess, {"pending": dict(prepared), "last": time.time() - 20 * 60, "ttl": ttl})
+            proxy._LIVE.pop(sess, None)
+            proxy._TTL.pop(sess, None)
+            got = bg_post(marked, sess)
+            check(f"{ttl} cache, 20-minute break: {'applied (cold)' if want else 'not applied (warm)'}",
+                  (len(got) == 1) == want,
+                  "on a 5-minute cache that break is a free rebuild, and the trim is wasted"
+                  if want else "a 1-hour cache is still warm at 20 minutes")
+        proxy._bg_save("sess-ttl5b", {"pending": dict(prepared), "last": time.time() - 3 * 60, "ttl": "5m"})
+        proxy._LIVE.pop("sess-ttl5b", None)
+        proxy._TTL.pop("sess-ttl5b", None)
+        check("5m cache, 3-minute gap: not applied (still warm)",
+              len(bg_post(marked, "sess-ttl5b")) == len(marked), "a warm 5-minute cache rebuilt for nothing")
         live = {"sent_tokens": 384_000, "skeleton": {"model": "claude-opus-5-5"}}
         # Trial numbers: 384K sent now, 317K after (the estimate scales what is
         # sent now by the compacted/current size ratio: 284K of 1,627.5K removed).

@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tokensaver import keepalive as ka, pricing, sim, transcripts  # noqa: E402
+from tokensaver import cachettl, keepalive as ka, pricing, sim, transcripts  # noqa: E402
 
 H = 3600
 
@@ -47,12 +47,15 @@ def main(proven: bool = True) -> int:
         info: dict = {}
         transcripts.api_history(s.path, info)
         cuts = sorted(sim._ts(ts) for _, ts in info.get("boundaries") or [] if ts)
+        ttls = cachettl.per_request(rq)           # live, keep-alive holds only a 1-hour cache
         for k, r in enumerate(rq):
             t = sim._ts(r.timestamp)
             g = sim._ts(rq[k + 1].timestamp) - t if k + 1 < len(rq) else None
             big = k + 1 >= ka.BIG_REQUESTS or returned or r.context >= ka.BIG_TOKENS
             if g is not None and g > H:
                 returned = True
+            if ttls[k] != "1h":
+                continue
             if (g is None and (now - t < 12 * H or ka.closed_by_user(s.path))) or (g is not None and g <= H) or r.context * (p.write_1h - p.read) / 1e6 < ka.MIN_SAVING_USD:
                 continue
             moments += 1
