@@ -881,6 +881,17 @@ def main() -> int:
         check("a stage that could not load did no heavy work (the worker goes on to prepare)",
               not proxy._prune_step("s18g", live),
               "the worker ended every round here: this session was never prepared again (2026-11-06)")
+        noted, saved_rec = [], proxy.vault.record
+        proxy.vault.record = lambda kind, **k: noted.append(k.get("summary"))
+        try:
+            proxy.prune.run_stage = lambda *a, **k: (None, {"stopped": "spotter: 26 GB free", "judged": 0})
+            proxy._prune_step("s18g", live)
+            proxy.prune.run_stage = lambda *a, **k: (None, {"stopped": "spotter: 27 GB free", "judged": 0})
+            proxy._prune_step("s18g", live)
+        finally:
+            proxy.vault.record = saved_rec
+        check("the same pause is recorded once, not every round", len(noted) <= 1,
+              f"{len(noted)} rows for one unchanged pause (~1,000 a day before)")
         proxy.prune.run_stage = lambda *a, **k: (None, {"stopped": "out of time", "judged": 3})
         proxy._bg_save("s18h", {"pending": dict(pend)})
         check("a stage that ran and stopped part-way did heavy work", proxy._prune_step("s18h", live),

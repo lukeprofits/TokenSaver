@@ -394,6 +394,21 @@ def _check_model() -> str | None:
     return background.LOCAL_MODEL if prune._name(background.LOCAL_MODEL, prune.installed()) else None
 
 
+_PAUSED: dict[str, str] = {}     # session -> the last prune pause recorded (stage and reason)
+
+
+def _note_pause(session: str, stage: str, why, meta: dict) -> None:
+    """Record a prune stage's pause once per stage and reason, not every 30-second round
+    (a stage that never fits wrote ~1,000 identical rows a day; the free-memory figure in
+    the reason changes every time, so digits do not count as a new reason)."""
+    key = f"{stage}: " + re.sub(r"[0-9.]+", "#", str(why))
+    if _PAUSED.get(session) == key:
+        return
+    _PAUSED[session] = key
+    vault.record("bg_prune", tool="proxy", session_id=session, index=False,
+                 summary=f"{stage} stage paused: {why}", meta=meta)
+
+
 def _prune_step(session: str, live: dict) -> bool:
     """Run the next prune stage for this session's pending compaction, if any.
     Returns whether it did heavy work. Never raises.
@@ -434,14 +449,12 @@ def _prune_step(session: str, live: dict) -> bool:
             if stage == "lines":
                 ok, why = prune.can_load(background.LOCAL_MODEL)
                 if not ok:
-                    vault.record("bg_prune", tool="proxy", session_id=session, index=False,
-                                 summary=f"lines stage paused: {why}", meta={"stage": stage, "stopped": why})
+                    _note_pause(session, stage, why, {"stage": stage, "stopped": why})
                     return False            # nothing ran: see below
                 shrink, info = _line_picks(session, messages, cut)
                 if info.get("stopped"):
                     prune.unload(background.LOCAL_MODEL)
-                    vault.record("bg_prune", tool="proxy", session_id=session, index=False,
-                                 summary=f"lines stage paused: {info['stopped']}", meta=info)
+                    _note_pause(session, stage, info["stopped"], info)
                     return True
                 res, _ = background._extract(messages, cut, drop, shrink=shrink)
             else:
@@ -450,8 +463,7 @@ def _prune_step(session: str, live: dict) -> bool:
                                              yielder=machine.Yield(),
                                              protect=background.latest_doc_views(messages[:cut]))
                 if drop is None:
-                    vault.record("bg_prune", tool="proxy", session_id=session, index=False,
-                                 summary=f"{stage} stage paused: {info.get('stopped')}", meta=info)
+                    _note_pause(session, stage, info.get("stopped"), info)
                     # Heavy work only if a model actually ran. A stage that could not even load
                     # (too little free memory) did none; returning True there made the worker end
                     # its round at this session every 30 s, so neither it nor any session after it
@@ -464,6 +476,7 @@ def _prune_step(session: str, live: dict) -> bool:
                 cand = {"text": res["text"], "new_tokens": res["new_tokens"], "stage": stage, "info": info,
                         "drop_refs": _ids_to_refs(messages[:cut], drop), "lines": stage == "lines"}
             cand["tried"] = stage
+            _PAUSED.pop(session, None)          # it ran: a later pause is news again
             vault.record("bg_prune", tool="proxy", session_id=session, index=False,
                          summary=f"{stage} stage: {before:,} -> {res['new_tokens']:,} tokens, "
                                  f"{'kept for the check' if better else 'not smaller'} "
@@ -573,15 +586,20 @@ def prune_offline(session: str, messages: list, pending: dict, state_dir: Path,
         _bg_save(session, {"pending": pending})
         live = {"messages": messages, "last": time.time() - 3600, "skeleton": {}}
         for _ in range(max_steps):
+            _PAUSED.pop(session, None)          # every pause recorded here: the loop reads it
+            n = len(events)
             heavy = _prune_step(session, live)
-            ev = events[-1] if events else {}
+            ev = events[-1] if len(events) > n else {}
             if on_step:
                 on_step(ev)
             got = _bg_load(session).get("pending") or {}
-            if got.get("prune_done") or not heavy:
+            if got.get("prune_done"):
                 break
             if "paused" in str(ev.get("summary", "")):
-                sleep(30)
+                sleep(30)                       # wait for memory, as before (a pause did no work)
+                continue
+            if not heavy:
+                break
         return _bg_load(session).get("pending") or pending, events
     finally:
         _bg_path, vault.record = saved_path, saved_record
