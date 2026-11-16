@@ -13,6 +13,9 @@
 #   ⚡          default healthy, no estimate for this session yet
 #   ⚡0%        default rewriting stopped by the automatic fallback (nothing saved)
 #   ⚡down      red     proxy not answering for 20 s (a shorter miss shows ⚡)
+# (Shown with a space after the ⚡: terminals and status-line renderers disagree on its
+# width, 1 or 2 columns, and a redraw then drew the next character twice: "⚡62%" read
+# "⚡662%", "⚡0%" "⚡00%". With the space, a doubled space is invisible.)
 # Other sessions show nothing extra. Nothing here may break the user's line:
 # every step falls back to printing what the original command printed.
 
@@ -58,12 +61,12 @@ case "${ANTHROPIC_BASE_URL:-}" in
     if [ -z "$h" ]; then
       since=$(cat "$downfile" 2>/dev/null); since=${since:-$now}
       if [ $(( now - since )) -ge 20 ]; then
-        badge="\033[31m⚡down\033[0m"
+        badge="\033[31m⚡ down\033[0m"
       else
         badge="⚡"                     # not answering yet: say nothing alarming
       fi
     elif printf '%s' "$h" | grep -q '"fallback": true' || printf '%s' "$h" | grep -q '"rewrite": "off"'; then
-      badge="⚡0%"
+      badge="⚡ 0%"
     else
       pct=""
       scache=/dev/null
@@ -82,9 +85,9 @@ case "${ANTHROPIC_BASE_URL:-}" in
         pct=$(sed -n 's/.*"pct"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]*\).*/\1/p' "$scache" 2>/dev/null | head -1)
       fi
       if [ -n "$pct" ] && grep -q '"done": true' "$scache" 2>/dev/null; then
-        badge="\033[32m⚡${pct}%\033[0m"
+        badge="\033[32m⚡ ${pct}%\033[0m"
       elif [ -n "$pct" ]; then
-        badge="⚡${pct}%"
+        badge="⚡ ${pct}%"
       else
         badge="⚡"
       fi
