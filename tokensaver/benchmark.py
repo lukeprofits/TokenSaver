@@ -340,8 +340,12 @@ class Counter:
     a count still blocked after RATE_BUDGET_S is given up, and it is reported as rate
     limited, never mixed with a rejected request."""
 
-    def __init__(self, auth: dict, rate_per_s: float = 5.0, sleep=time.sleep):
+    def __init__(self, auth: dict, rate_per_s: float = 5.0, sleep=time.sleep, refresh=None):
         self.headers = dict(auth, **{"anthropic-version": "2023-06-01", "content-type": "application/json"})
+        # A run takes 10-20 minutes and Claude Code refreshes its login meanwhile, revoking the
+        # token read at the start (2026-11-17: 1,268 of 2,404 counts "401 OAuth access token has
+        # been revoked"). `refresh() -> auth headers | None` reads the login again on a 401.
+        self.refresh, self.auth_lock, self.refreshed = refresh, threading.Lock(), 0
         self.gap, self.next_at, self.lock, self.sleep = 1.0 / rate_per_s, 0.0, threading.Lock(), sleep
         self.calls = self.failed = self.rate_limited = self.attempts = self.skipped_busy = 0
         self.busy_until = 0.0
@@ -424,10 +428,13 @@ class Counter:
     def count_body(self, body: dict, beta: str | None = None,
                    budget: float | None = None) -> tuple[int | None, str]:
         """(input tokens, "") or (None, "<status> <message>" | "rate limited ...")."""
-        headers = dict(self.headers)
-        if beta:
-            headers["anthropic-beta"] = ",".join(x for x in (headers.get("anthropic-beta"), beta) if x)
-        start, attempt, err = time.time(), 0, "no response"
+        def build():
+            h = dict(self.headers)
+            if beta:
+                h["anthropic-beta"] = ",".join(x for x in (h.get("anthropic-beta"), beta) if x)
+            return h
+        headers = build()
+        start, attempt, err, renewed = time.time(), 0, "no response", False
         while True:
             with self.lock:
                 wait = max(self.next_at, 0) - time.time()
@@ -444,6 +451,9 @@ class Counter:
                     return json.loads(r.read())["input_tokens"], ""
             except urllib.error.HTTPError as e:
                 self._pace(e.headers)
+                if e.code == 401 and not renewed and self._renew(headers):
+                    renewed, headers = True, build()
+                    continue
                 if e.code not in (429, 500, 502, 503, 504, 529):
                     try:
                         msg = (json.loads(e.read()).get("error") or {}).get("message", "")[:200]
@@ -463,6 +473,28 @@ class Counter:
             if time.time() - start + backoff > (budget if budget is not None else RATE_BUDGET_S):
                 return None, err
             self.sleep(backoff)
+
+    def _renew(self, used: dict) -> bool:
+        """After a 401: the login read again, if it changed (another thread may have
+        renewed it already). Whether there is a different one to retry with."""
+        if not self.refresh:
+            return False
+        key = lambda h: (h.get("authorization"), h.get("x-api-key"))
+        with self.auth_lock:
+            if key(self.headers) != key(used):
+                return True                       # renewed meanwhile by another count
+            try:
+                cred = self.refresh()
+            except Exception:
+                cred = None
+            auth = cred[0] if isinstance(cred, tuple) else cred
+            if not auth or key(auth) == key(used):
+                return False
+            for k in ("authorization", "x-api-key"):
+                self.headers.pop(k, None)
+            self.headers.update(auth)
+            self.refreshed += 1
+            return True
 
 
 def _pair(fn, a, b, patient: bool = False):
@@ -1018,6 +1050,15 @@ def reliability(rows: list[dict], count) -> list[str]:
     """A plain warning when too many token counts failed, with why it matters."""
     if not count.calls or count.failed / count.calls <= UNRELIABLE_SHARE:
         return []
+    auth = sum(v for k, v in count.errors.items() if k.startswith(("401", "403")))
+    if auth * 2 > count.failed:
+        return ["",
+                f"*** WARNING: {count.failed:,} of {count.calls:,} token counts failed "
+                f"({100 * count.failed / count.calls:.0f}%), {auth:,} of them refused the login "
+                "(401/403). The savings above are probably TOO LOW.",
+                "    The login stopped working during the run (logged out, or a refresh the benchmark",
+                "    could not pick up). Nothing is wrong with your history or with TokenSaver.",
+                "    What to do: check Claude Code works, then run the benchmark again."]
     hit = sorted((r for r in rows if r.get("count_failures")), key=lambda r: -r["count_failures"])
     out = ["",
            f"*** WARNING: {count.failed:,} of {count.calls:,} token counts failed "
@@ -1534,7 +1575,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
             return 3
         if input("\nStart? [y/N] ").strip().lower() not in ("y", "yes"):
             return 1
-    count = Counter(auth)
+    count = Counter(auth, refresh=credentials)
     # Cache keep-alive is part of TokenSaver unless switched off: replayed with the proxy's
     # own rule, on this user's day ends from their interactive sessions.
     from . import keepalive as ka
@@ -1639,6 +1680,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               "cache_ttl": {"main_ttl": main_ttl, **ttl_decision},
               "thinking_factors": factors,
               "counts": {"calls": count.calls, "failed": count.failed, "rate_limited": count.rate_limited,
+                         "login_renewed": count.refreshed,
                          "attempts": count.attempts, "repairs": count.repairs,
                          "repaired_sessions": count.repaired_sessions,
                          "escalated": {str(k): v for k, v in sorted(count.escalated.items())},

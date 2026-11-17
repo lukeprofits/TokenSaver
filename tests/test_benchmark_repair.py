@@ -143,6 +143,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
     plan: list = []          # statuses to return in order; then 200
     retry_after = "0.01"
     strict_api = True
+    revoked: set = set()     # keys answered 401 (a login refreshed mid-run)
 
     def log_message(self, *a):
         pass
@@ -150,6 +151,8 @@ class Stub(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         status = Stub.plan.pop(0) if Stub.plan else 200
+        if self.headers.get("x-api-key") in Stub.revoked:
+            status = 401
         if status == 200 and Stub.strict_api:
             v = violations(body["messages"])
             if v:
@@ -181,8 +184,27 @@ class CounterTest(unittest.TestCase):
 
     def setUp(self):
         mock.patch.object(benchmark, "COUNT_URL", f"http://127.0.0.1:{self.server.server_port}/v1/messages/count_tokens").start()
-        Stub.plan, Stub.strict_api = [], True
+        Stub.plan, Stub.strict_api, Stub.revoked = [], True, set()
         self.c = benchmark.Counter({"x-api-key": "k"}, rate_per_s=1000, sleep=lambda s: None)
+
+    def test_a_login_refreshed_mid_run_is_read_again(self):
+        Stub.revoked = {"k"}
+        c = benchmark.Counter({"x-api-key": "k"}, rate_per_s=1000, sleep=lambda s: None,
+                              refresh=lambda: ({"x-api-key": "k2"}, "login"))
+        self.assertIsNotNone(c("claude-opus-5-5", [U(TXT("hi"))]))
+        self.assertEqual((c.failed, c.refreshed), (0, 1))
+        self.assertIsNotNone(c("claude-opus-5-5", [U(TXT("again"))]))
+        self.assertEqual(c.refreshed, 1, "the new login is kept for later counts")
+
+    def test_a_login_that_stays_revoked_fails_once_per_count(self):
+        Stub.revoked = {"k"}
+        c = benchmark.Counter({"x-api-key": "k"}, rate_per_s=1000, sleep=lambda s: None,
+                              refresh=lambda: ({"x-api-key": "k"}, "login"))
+        self.assertIsNone(c("claude-opus-5-5", [U(TXT("hi"))]))
+        self.assertEqual((c.failed, c.refreshed, c.attempts), (1, 0, 1))
+        warn = "\n".join(benchmark.reliability([], c))
+        self.assertIn("refused the login", warn)
+        self.assertNotIn("transcripts", warn)
 
     def tearDown(self):
         mock.patch.stopall()
