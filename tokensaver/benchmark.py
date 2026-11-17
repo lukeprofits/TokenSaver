@@ -1162,12 +1162,26 @@ def live_line(rows: list[dict]) -> list[str]:
     return out
 
 
+# Fewer live requests than this and a live figure is mostly chance: two cache misses on an
+# install evening (2026-11-16: 21 requests, 4 minutes) read as "-17.8% saved". Below it the
+# lines say so instead of printing a percent; the numbers stay in the result file.
+LIVE_MIN_REQUESTS = 500
+
+
+def _too_early(n: int) -> str:
+    return (f"too early to judge: {n:,} requests through TokenSaver so far (a fair figure needs "
+            f"about {LIVE_MIN_REQUESTS} of normal use); the replay above is the estimate")
+
+
 def measured_line(rows: list[dict]) -> str:
     """For sessions that really went through TokenSaver: what you actually paid, against the
     rebuilt plain cost and against the replay of today's TokenSaver on the same sessions."""
     ts = [r for r in rows if r.get("through_tokensaver")]
     if not ts:
         return " sessions already through TokenSaver: none"
+    seen = sum((r.get("live") or {}).get("requests") or 0 for r in ts)
+    if 0 < seen < LIVE_MIN_REQUESTS:          # 0: the vault has no record of them (older)
+        return f" {len(ts)} sessions partly went through TokenSaver: " + _too_early(seen)
     plain = sum(r["plain_cost"] for r in ts)
     real = sum(r["real_cost"] for r in ts)
     ours = sum(r["ours_cost"] for r in ts)
@@ -1279,7 +1293,10 @@ def machine_line(st: dict) -> list[str]:
             if x.get("plain"):
                 parts.append(f"{label.replace('_', ' ')} ${x['real']:,.2f} vs ${x['plain']:,.2f} plain "
                              f"({_pct(x['real'], x['plain']):.1f}% saved, {x['requests']:,} requests)")
-        if parts:
+        n = (b.get("all") or {}).get("requests") or 0
+        if n < LIVE_MIN_REQUESTS:
+            out.append("   live bill: " + _too_early(n))
+        elif parts:
             out.append("   live bill: " + "; ".join(parts))
     return out
 

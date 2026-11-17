@@ -197,12 +197,12 @@ class MachineStateTest(unittest.TestCase):
     def test_running_proxy_line(self):
         st = {"proxy": {"code": "a", "code_on_disk": "b", "audit": {"on": False, "disabled": "401 from count_tokens"},
                         "fallback": False},
-              "bill": {"last_7_days": {"real": 90.0, "plain": 100.0, "requests": 10},
-                       "all": {"real": 0, "plain": 0, "requests": 0}}}
+              "bill": {"last_7_days": {"real": 90.0, "plain": 100.0, "requests": 600},
+                       "all": {"real": 0, "plain": 0, "requests": 600}}}
         lines = benchmark.machine_line(st)
         self.assertEqual(lines[0], " TokenSaver here: proxy code a (older than the code on disk: restart), "
                                    "audit off (401 from count_tokens), fallback off")
-        self.assertEqual(lines[1], "   live bill: last 7 days $90.00 vs $100.00 plain (10.0% saved, 10 requests)")
+        self.assertEqual(lines[1], "   live bill: last 7 days $90.00 vs $100.00 plain (10.0% saved, 600 requests)")
 
     def test_cost_by_model(self):
         rows = [{"model": "claude-opus-5-5", "plain_cost": 10.0, "real_cost": 9.0},
@@ -210,6 +210,24 @@ class MachineStateTest(unittest.TestCase):
         self.assertEqual(benchmark.cost_by_model_line(rows),
                          ["   by model: opus 5.5 $10.00 vs $9.00 (1), sonnet 5.5 $2.00 vs $2.00 (1)"])
         self.assertEqual(benchmark.cost_by_model_line(rows[:1]), [])
+
+
+class TooEarlyTest(unittest.TestCase):
+    """A few live requests print no live percent (an install evening read as -17.8%)."""
+
+    def test_measured_line(self):
+        row = {"through_tokensaver": True, "plain_cost": 4.0, "real_cost": 5.0, "ours_cost": 3.0,
+               "billed_model_cost": 5.0, "live": {"requests": 21}}
+        self.assertIn("too early to judge: 21 requests", benchmark.measured_line([row]))
+        row["live"]["requests"] = benchmark.LIVE_MIN_REQUESTS
+        self.assertIn("-25.0% cheaper as it ran", benchmark.measured_line([row]))
+
+    def test_machine_line(self):
+        bill = {"requests": 39, "real": 5.63, "plain": 4.78}
+        st = {"proxy": None, "bill": {"all": bill, "last_7_days": bill}}
+        line = benchmark.machine_line(st)[1]
+        self.assertIn("too early to judge: 39 requests", line)
+        self.assertNotIn("%", line)
 
 
 if __name__ == "__main__":
