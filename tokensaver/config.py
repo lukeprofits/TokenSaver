@@ -45,6 +45,9 @@ SPECS: dict[str, Spec] = {s.name: s for s in (
     Spec("binding_monitor", None, bool, True,
          doc="ask the API to report thinking blocks that fail the preserved-thinking check (header only)"),
     Spec("bg_yield", None, bool, True, doc="ease off background model work when the machine strains"),
+    Spec("bg_trim_pastes", None, bool, False,
+         doc="in a break-time trim's old part, shorten giant pasted logs and data (200+ lines, machine "
+             "output; never prose or code, never recent history)"),
     Spec("local_ai", None, str, "auto",
          doc="auto | on | off: local models for break-time trimming (auto: only if this machine passes the "
              "specs and disk checks; on: skip the disk check; off: never)"),

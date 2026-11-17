@@ -43,7 +43,7 @@ import time
 import urllib.request
 from collections import Counter
 
-from . import compress, config
+from . import compress, config, paste
 
 # Settings come from `config` (file, env for manual runs). These module values
 # are the current ones; `refresh()` re-reads them, and every function looks
@@ -65,6 +65,7 @@ KEEP_TOKENS = config.get("bg_keep_tokens")      # recent history kept verbatim
 # compactions on smaller sessions); flat from 5K to 15K, lower at 25K+.
 MIN_REMOVABLE = config.get("bg_min_removable")
 INDEX_SIZE = config.get("bg_index")             # 2,000: 95.6% recall, 1,000: 85.7%; gate passed at both, 1,000 ~5 points smaller
+TRIM_PASTES = config.get("bg_trim_pastes")      # giant pasted logs in the old part (`paste`)
 RESULT_CHARS = 1_500        # of each tool result shown to the QA gate
 EXTRACT_RESULT_CHARS = 300  # of each old tool result kept by the extractive mode
 QA_CHUNKS = 4               # 24 questions: 18 left pass/fail to noise (measured)
@@ -91,10 +92,10 @@ Output ONLY JSON: [true, false, ...]"""
 
 def refresh() -> None:
     """Re-read this module's settings from `config`."""
-    global OLLAMA_URL, LOCAL_MODEL, KEEP_TOKENS, MIN_REMOVABLE, INDEX_SIZE
+    global OLLAMA_URL, LOCAL_MODEL, KEEP_TOKENS, MIN_REMOVABLE, INDEX_SIZE, TRIM_PASTES
     OLLAMA_URL, LOCAL_MODEL = config.get("ollama_url"), config.get("local_model")
     KEEP_TOKENS, MIN_REMOVABLE = config.get("bg_keep_tokens"), config.get("bg_min_removable")
-    INDEX_SIZE = config.get("bg_index")
+    INDEX_SIZE, TRIM_PASTES = config.get("bg_index"), config.get("bg_trim_pastes")
 
 
 # ---- local model -------------------------------------------------------------
@@ -349,7 +350,8 @@ def stale_plan_mode(messages: list) -> set[int]:
 
 def render(messages: list, result_chars: int = RESULT_CHARS, call_chars: int = 800,
            keep: set[str] | None = None, full_ids: set[str] | None = None,
-           drop_routine: bool = False, skip: set[int] | None = None, shrink=None) -> list[str]:
+           drop_routine: bool = False, skip: set[int] | None = None, shrink=None,
+           pastes: set[str] | None = None) -> list[str]:
     """One line of text per message, for the compaction text and the QA gate.
     Thinking is left out; tool results are cut to their head, plus any line
     carrying a detail in `keep`. With `drop_routine`, Claude Code's
@@ -361,7 +363,11 @@ def render(messages: list, result_chars: int = RESULT_CHARS, call_chars: int = 8
     `shrink(kind, text) -> text` (the "lines" prune stage, `prune.line_picker`)
     may shorten old document views ("doc"), tool-result excerpts ("result"),
     long system text ("system") and system reminders ("reminder"); never what
-    the developer or Claude wrote."""
+    the developer or Claude wrote.
+
+    `pastes` (a set of details to keep, or None for off): a giant machine-made
+    region pasted into a developer's message is shortened like tool output
+    (`paste.cut`); the developer's own words around it stay as written."""
     out = []
     removed = 0
     for m in messages:
@@ -386,6 +392,9 @@ def render(messages: list, result_chars: int = RESULT_CHARS, call_chars: int = 8
                         text = shrink("system", text)
                     elif role == "USER" and text.lstrip().startswith("<system-reminder>"):
                         text = shrink("reminder", text)
+                if pastes is not None and role == "USER" and len(text) >= paste.MIN_CHARS \
+                        and not text.lstrip().startswith("<system-reminder>"):
+                    text = paste.cut(text, pastes)[0]
                 parts.append(text)
             elif t == "tool_use":
                 inp = x.get("input") or {}
@@ -549,25 +558,54 @@ def header(n_old: int, old_tokens: int) -> str:
             f"developer was away; the most recent messages follow verbatim.]")
 
 
-def _extract(messages: list, cut: int, prune: set[int] | None = None, shrink=None):
+def paste_keep(messages: list, keep: set[str]) -> set[str]:
+    """What a cut paste must keep: details Claude wrote (`keep`) plus details in the
+    developer's own words anywhere in the session (outside pasted regions, which would
+    otherwise keep every line of themselves)."""
+    out = set(keep)
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        for x in _items(m):
+            if not (isinstance(x, dict) and x.get("type") == "text") or not x.get("text"):
+                continue
+            text = x["text"]
+            if text.lstrip().startswith("<system-reminder>"):
+                continue
+            spans, _ = paste.regions(text) if len(text) >= paste.MIN_CHARS else ([], {})
+            if spans:
+                lines = text.split("\n")
+                for a, b in reversed(spans):
+                    del lines[a:b]
+                text = "\n".join(lines)
+            out |= compress.details(text)
+    return out
+
+
+def _extract(messages: list, cut: int, prune: set[int] | None = None, shrink=None,
+             pastes: bool | None = None):
     """The extractive replacement for messages[:cut], and a per-stretch view of
     it for the gate. No model: every user and assistant word kept as written,
     each tool call as one line, each tool result as its head. It invents
-    nothing; what it drops is tool output, and the files are still on disk."""
+    nothing; what it drops is tool output, and the files are still on disk.
+    `pastes` (default: the `bg_trim_pastes` setting): giant pasted logs in the old
+    part are cut like tool output too (`paste`)."""
     old, recent = messages[:cut], messages[cut:]
     keep = mentioned(messages)
+    pk = paste_keep(messages, keep) if (TRIM_PASTES if pastes is None else pastes) else None
     docs = latest_doc_views(old)
     skip = stale_plan_mode(messages) | set(prune or ())
     body = "\n\n".join(render(old, EXTRACT_RESULT_CHARS, 200, keep=keep, full_ids=docs,
-                               drop_routine=True, skip=skip, shrink=shrink))
+                               drop_routine=True, skip=skip, shrink=shrink, pastes=pk))
     idx = index(old, recent, shown=body)
     text = (f"{header(cut, size_tokens(old))} Tool results are cut to their first "
-            f"lines.\n\n## The earlier part of the session\n\n{body}"
+            f"lines{', and so are very large pasted logs' if pk is not None and paste.MARK in body else ''}."
+            f"\n\n## The earlier part of the session\n\n{body}"
             f"\n\n## Identifiers from the earlier part\n\n{idx}")
 
     def candidate_for(i: int, j: int) -> str:
         part = "\n\n".join(render(old[i:j], EXTRACT_RESULT_CHARS, 200, keep=keep, full_ids=docs,
-                                   drop_routine=True, skip=skip, shrink=shrink))
+                                   drop_routine=True, skip=skip, shrink=shrink, pastes=pk))
         return f"{part}\n\n## Identifiers from the earlier part\n\n{idx[:12_000]}"
     result = {"cut": cut, "prefix_fp": fingerprint(old), "text": text, "mode": "extract",
               "old_tokens": size_tokens(old), "new_tokens": len(text) // CHARS_PER_TOKEN,
@@ -575,14 +613,14 @@ def _extract(messages: list, cut: int, prune: set[int] | None = None, shrink=Non
     return result, candidate_for
 
 
-def build(messages: list) -> dict | None:
+def build(messages: list, pastes: bool | None = None) -> dict | None:
     """The extractive compaction, deterministic and model-free, so tuning can
     estimate what compaction would save at no cost (the same text `prepare`
-    makes)."""
+    makes). `pastes`: see `_extract`."""
     cut = choose_cut(messages)
     if not cut or size_tokens(messages[:cut]) < MIN_REMOVABLE:
         return None
-    return _extract(messages, cut)[0]
+    return _extract(messages, cut, pastes=pastes)[0]
 
 
 # The rules-only compaction is applied without a model check (2026-10-23). It

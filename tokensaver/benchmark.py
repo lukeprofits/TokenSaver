@@ -69,7 +69,7 @@ import urllib.request
 from pathlib import Path
 
 from . import names
-from . import __version__, audit, background as bg, cachettl, config, passes, pricing, sim, transcripts
+from . import __version__, audit, background as bg, cachettl, compress, config, passes, paste, pricing, sim, transcripts
 
 # Tokens per signature char when this machine can't measure (see thinking_factors):
 # the one default, kept with its history in background.TOKENS_PER_SIGNATURE_CHAR.
@@ -665,6 +665,114 @@ def thinking_factors(sessions: list, count: Counter, per_model: int = 4) -> dict
 
 # ---- one session ----------------------------------------------------------------
 
+def _user_texts(messages: list):
+    """The developer's own text blocks (no system reminders)."""
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        for b in [{"type": "text", "text": c}] if isinstance(c, str) else c or []:
+            t = b.get("text") if isinstance(b, dict) and b.get("type") == "text" else None
+            if t and not t.lstrip().startswith("<system-reminder>"):
+                yield t
+
+
+def _pasted(text: str) -> str:
+    """The qualifying pasted regions of one text, joined ("" when none)."""
+    spans, _ = paste.regions(text) if len(text) >= paste.MIN_CHARS else ([], {})
+    lines = text.split("\n")
+    return "\n".join("\n".join(lines[a:b]) for a, b in spans)
+
+
+def _lost(old: list, kept_text: str, later: list) -> dict[str, int]:
+    """Quality of a trim that cut pastes, judged on what really happened next: of the hard
+    details (`compress.details`: names, paths, numbers, ids) the trim left out, how many
+    did Claude or the developer use again after it. The same for the tool output the
+    trim cuts today (already measured safe), as the yardstick. Counts only."""
+    used: set[str] = set()
+    for m in later:
+        c = m.get("content")
+        for b in [{"type": "text", "text": c}] if isinstance(c, str) else c or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and not (b.get("text") or "").lstrip().startswith("<system-reminder>"):
+                used |= compress.details(b.get("text") or "")
+            elif b.get("type") == "tool_use":
+                used |= compress.details(json.dumps(b.get("input"), ensure_ascii=False))
+    kept = compress.details(kept_text)
+    pasted = set().union(*(compress.details(_pasted(t)) for t in _user_texts(old))) if old else set()
+    tool: set[str] = set()
+    for m in old:
+        for b in m.get("content") if isinstance(m.get("content"), list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                c = b.get("content")
+                tool |= compress.details(c if isinstance(c, str) else "\n".join(
+                    x.get("text") or "" for x in c or [] if isinstance(x, dict)))
+    # Short details ("10", "ok") recur by chance and would read as used again; 3+ characters.
+    real = lambda xs: {x for x in xs if len(x) >= 3}
+    p_gone, t_gone = real(pasted - kept), real(tool - kept - pasted)
+    return {"paste_cut": len(p_gone), "paste_lost": len(p_gone & used),
+            "tool_cut": len(t_gone), "tool_lost": len(t_gone & used)}
+
+
+def paste_scan(messages: list) -> dict:
+    """Big pastes in a session's history: how many qualify for `bg_trim_pastes`, and why the
+    others were left alone (counts only)."""
+    out = {"qualifying": 0, "left_alone": {}}
+    for t in _user_texts(messages):
+        if len(t) < paste.MIN_CHARS and t.count("\n") < paste.MIN_LINES:
+            continue
+        spans, left = paste.regions(t)
+        out["qualifying"] += len(spans)
+        for k, v in left.items():
+            out["left_alone"][k] = out["left_alone"].get(k, 0) + v
+    return out
+
+
+def _soft(fn, *args) -> list[str]:
+    """A report section that must never cost the run: a failure becomes one line."""
+    try:
+        return fn(*args)
+    except Exception as exc:
+        return [f" {fn.__name__.replace('_lines', '')}: not reported ({type(exc).__name__})"]   # no text: the file is shared
+
+
+def pastes_lines(rows: list[dict], with_pastes: dict, scans: dict) -> list[str]:
+    """What cutting giant pasted logs in trims would change on this history, and what it
+    lost (`bg_trim_pastes`, off by default): the evidence to turn it on or not."""
+    q = sum(s["qualifying"] for s in scans.values())
+    left: dict[str, int] = {}
+    for s in scans.values():
+        for k, v in s["left_alone"].items():
+            left[k] = left.get(k, 0) + v
+    alone = ", ".join(f"{k} x{v}" for k, v in sorted(left.items(), key=lambda kv: -kv[1]))
+    if not q:
+        return [f" giant pastes (200+ lines of logs or data): none here"
+                + (f"; big pastes left alone: {alone}" if alone else "")]
+    by = {r["session"]: r for r in rows if "skipped" not in r}
+    pairs = [(by[s], v) for s, v in with_pastes.items() if s in by and "skipped" not in v]
+    out = [f" giant pastes (200+ lines of logs or data): {q} in {sum(1 for x in scans.values() if x['qualifying'])} "
+           f"sessions" + (f"; left alone: {alone}" if alone else "")]
+    if pairs:
+        plain = sum(a["plain_cost"] for a, _ in pairs)
+        off, on = sum(a["ours_cost"] for a, _ in pairs), sum(b["ours_cost"] for _, b in pairs)
+        n_off, n_on = sum(a["compactions"] for a, _ in pairs), sum(b["compactions"] for _, b in pairs)
+        total_plain = sum(r["plain_cost"] for r in by.values())
+        total_off = sum(r["ours_cost"] for r in by.values())
+        out.append(f"   cutting them in trims (`bg_trim_pastes`, off by default): those sessions "
+                   f"{_pct(off, plain):.1f}% -> {_pct(on, plain):.1f}% cheaper, all sessions "
+                   f"{_pct(total_off, total_plain):.1f}% -> {_pct(total_off - off + on, total_plain):.1f}% "
+                   f"({_usd(off - on)}); trims applied {n_off} -> {n_on}")
+        lost = [t["lost"] for _, b in pairs for t in b.get("trims") or [] if t.get("lost")]
+        tot = {k: sum(x[k] for x in lost) for k in ("paste_cut", "paste_lost", "tool_cut", "tool_lost")}
+        share = lambda a, b: f"{100 * a / b:.1f}%" if b else "-"
+        out.append(f"   quality, on what was used after each break: of {tot['paste_cut']:,} details cut from "
+                   f"pastes, {tot['paste_lost']:,} were used again ({share(tot['paste_lost'], tot['paste_cut'])}); "
+                   f"tool output cut by today's trims: {tot['tool_lost']:,} of {tot['tool_cut']:,} "
+                   f"({share(tot['tool_lost'], tot['tool_cut'])})")
+    return out
+
+
 def _parts(messages: list) -> dict[str, int]:
     """Characters of `messages` by kind: what a trim had to work with (numbers only)."""
     out: dict[str, int] = {}
@@ -698,7 +806,7 @@ def _parts(messages: list) -> dict[str, int]:
 
 def replay(d, count: Counter, step: int, after_s: float, payback: float, factor: float,
            transform=None, prune=None, keepalive_ends: dict | None = None,
-           main_ttl: str | None = None) -> dict:
+           main_ttl: str | None = None, pastes: bool = False) -> dict:
     """One session. `transform(k, hist) -> messages` replaces tokensaver's
     rewrite with another tool's (experiments use it for Headroom); then no
     compaction is emulated. `prune(cand, hist) -> cand` (`--benchmark full`)
@@ -710,7 +818,9 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     including after a session's last request, where nobody came back.
     `main_ttl` ("1h"): the cache lifetime TokenSaver sets for the main conversation
     (`cachettl.choose`); the TokenSaver side is priced and decided with it, plain Claude Code
-    keeps the lifetime each request really had."""
+    keeps the lifetime each request really had.
+    `pastes`: trims also cut giant pasted logs (`bg_trim_pastes`); each applied trim then
+    records which details it cut that were used again after the break (`_lost`)."""
     from . import keepalive as ka
     kept_warm: set[int] = set()
     bump_events: list[tuple[int, int]] = []     # (request the bumps followed, how many)
@@ -773,7 +883,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         """(cand, s_now, s_new, reps) for a trim at request k, or (None, why not)."""
         if not bg.worth_compacting(hist):
             return None, "too little old history"
-        cand = bg.build(hist)
+        cand = bg.build(hist, pastes=pastes)
         if not cand:
             return None, "too little to remove"
         if applied is not None and cand["cut"] <= applied["cut"]:
@@ -854,6 +964,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                        "read": prices[k].read}
                 if s_new < s_now and (cold or reps <= payback):
                     rec.update(applied=True, parts=_parts(hist[:cand["cut"]]), kept=len(cand["text"]))
+                    if pastes:
+                        rec["lost"] = _lost(hist[:cand["cut"]], cand["text"], messages[entry[0]:])
                     if prune is not None:
                         cand = prune(cand, hist)
                     applied, epoch = cand, epoch + 1
@@ -988,7 +1100,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             "trims": [{"cold": r["cold"], "applied": r["applied"], "reps": round(r["reps"], 1),
                        "after": r["after"], "s_now": r["s_now"], "s_new": r["s_new"],
                        **({"value": r["value"]} if "value" in r else {}),
-                       **({"parts": r["parts"], "kept_chars": r["kept"]} if r["applied"] else {})}
+                       **({"parts": r["parts"], "kept_chars": r["kept"]} if r["applied"] else {}),
+                       **({"lost": r["lost"]} if "lost" in r else {})}
                       for r in trims],
             "no_trim": no_trim, "short_trims": short_out,
             "transcript_duplicates": tinfo.get("duplicates", 0),
@@ -1612,6 +1725,8 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         print(f"  {_version(m)}: {fa['value']:.3f} tokens per signature char ({fa['how']})")
     fallback = {"value": DEFAULT_SIG_FACTOR, "source": "fallback", "n": 0, "how": "fallback"}
     rows, t0 = [], time.time()
+    scans: dict = {}                # session -> big pastes found (`paste_scan`)
+    with_pastes: dict = {}          # session -> its replay with `bg_trim_pastes` on
     # The replay's own size estimates (worth_compacting, choose_cut) use the same
     # per-model rate as its arithmetic, not the default.
     bg.SIG_FACTOR = lambda model=None: factors.get(model, fallback)["value"]
@@ -1631,6 +1746,24 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
         r["session"] = hashlib.sha256(d.stem.encode()).hexdigest()[:8]     # not the real id
         r["factor_source"] = fa["source"]
         rows.append(r)
+        # Giant pasted logs: the same session again with trims cutting them, so one run says
+        # what `bg_trim_pastes` would save here and what it would have lost.
+        try:
+            scan = paste_scan(transcripts.api_history(d.session.path)[0])
+        except Exception:
+            scan = {"qualifying": 0, "left_alone": {}}
+        if scan["qualifying"] or scan["left_alone"]:
+            scans[r["session"]] = scan
+        if scan["qualifying"] and "skipped" not in r:
+            try:
+                v = replay(d, count, step, after_s, payback, f, prune=pruner, keepalive_ends=ka_ends,
+                           main_ttl=main_ttl, pastes=True)
+            except Exception as exc:
+                v = {"skipped": f"{type(exc).__name__}"}
+            with_pastes[r["session"]] = v
+            if "skipped" not in v:
+                print(f"         with giant pastes cut: {_pct(v['ours_cost'], v['plain_cost']):5.1f}% cost  "
+                      f"compactions {v['compactions']}", flush=True)
         if "skipped" in r:
             print(f"  [{i}/{len(data)}] skipped: {r['skipped']}", flush=True)
             continue
@@ -1654,6 +1787,7 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               *live_line(ok),
               *machine_line(state),
               *trims_lines(ok, payback, after_s / 60),
+              *_soft(pastes_lines, rows, with_pastes, scans),
               f" token counts: {count.calls:,} calls, {count.failed} failed"
               + (f" ({'; '.join(f'{k} x{v}' for k, v in sorted(count.errors.items(), key=lambda kv: -kv[1])[:3])})"
                  if count.errors else "")
@@ -1679,6 +1813,11 @@ def run(step: int = 8, since: str | None = None, yes: bool = False, out: Path | 
               "settings": {"bg_after_min": after_s / 60, "bg_warm_payback_max": payback},
               "cache_ttl": {"main_ttl": main_ttl, **ttl_decision},
               "thinking_factors": factors,
+              # Giant pasted logs (`bg_trim_pastes`): what each session's big pastes were, and its
+              # replay with trims cutting them (numbers only, like the rows).
+              "pastes": {"scans": scans, "with": {s: {k: v.get(k) for k in (
+                  "skipped", "plain_cost", "ours_cost", "plain_tokens", "ours_tokens", "compactions", "trims")}
+                  for s, v in with_pastes.items()}},
               "counts": {"calls": count.calls, "failed": count.failed, "rate_limited": count.rate_limited,
                          "login_renewed": count.refreshed,
                          "attempts": count.attempts, "repairs": count.repairs,

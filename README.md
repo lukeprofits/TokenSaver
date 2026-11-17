@@ -266,6 +266,17 @@ compaction applies. On a 5-minute cache, keep-alive stays off and break-time
 trims apply at any break over 15 minutes, since the cache is gone anyway.
 `tokensaver cache-ttl` shows the numbers, and `off` leaves it to Claude Code.
 
+**Giant pasted logs (off by default, being measured).** What you type is never
+edited, with one optional exception. If you paste a whole log, stack trace or
+data dump, a break-time trim can shorten it like old tool output. It only
+applies to a pasted region of 200+ lines that is clearly machine output: never
+prose, never code, never anything in the recent history kept word for word.
+The trim keeps the paste's first and last 40 lines, one line of each kind of
+error or warning, and every line you or Claude referred to later. Your own words
+around the paste stay as written. `tokensaver --benchmark` prices it on your
+history and checks it against what was actually used after each break.
+Turn it on with `tokensaver config set bg_trim_pastes true`, and off with `false`.
+
 ```sh
 tokensaver keepalive        # on or off, when it stops today, what it saved and spent
 tokensaver keepalive on     # turn it on
