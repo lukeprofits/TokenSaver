@@ -123,6 +123,8 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
     ttl_of: dict = {}          # session -> cache lifetime of its last main request (`cachettl`)
     last_main_id: dict = {}
     miss_read: dict = {}       # session -> what its last missed main request still read
+    same_prev: dict = {}       # session -> its last main request went out unchanged
+    same = lambda rw: bool(rw.get("bytes_in")) and rw.get("bytes_in") == rw.get("bytes_out")
     for ts, session, cls, u, rw, p, rid in reqs:
         inp = int(u.get("input_tokens") or 0)
         rd = int(u.get("cache_read_input_tokens") or 0)
@@ -164,6 +166,12 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
                 cause = "compaction applied on a warm cache"
             elif prev and sent < 0.5 * prev[2]:
                 cause = "Claude Code replaced the history (/compact)"
+            elif same(rw) and same_prev.get(session):
+                # This request and the one before went out exactly as Claude Code sent them
+                # (passes only shrink, so equal sizes mean unchanged bytes): plain Claude Code
+                # sends the same and misses the same. Seen on a first evening after install
+                # (2026-11-16: 1 of 21 requests changed, 2 misses charged as ours).
+                cause = "Claude Code's own miss (TokenSaver sent its bytes unchanged)"
             else:
                 cause = "unknown (possibly Anthropic-side)"
         ours = cause is not None and not cause.startswith("Claude Code")
@@ -190,6 +198,7 @@ def compute(session_prefix: str = "", since: str = "") -> Bill:
             last[session] = (t, plain_size, sent)
             ttl_of[session] = ttl
             last_main_id[session] = rid
+            same_prev[session] = same(rw)
         elif (rw.get("aux_unmatched") == "separate" or cls not in ("auxiliary", "compaction")
               or (cause or "").startswith("Claude Code's separate")):
             # A separate conversation TokenSaver never touched: plain Claude Code pays the same.

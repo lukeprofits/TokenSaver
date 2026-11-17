@@ -240,7 +240,7 @@ def simulate(b, decide):
 
 
 def rule(b, ends):
-    big = b["reqs"] >= ka.BIG_REQUESTS or b["rb"] or b["size"] >= ka.BIG_TOKENS
+    big = ka.is_big(b["reqs"], b["rb"], b["size"])
 
     def decide(k):
         if not big or k > ka.MAX_BUMPS or k * T > ka.HOLD_MAX_S:

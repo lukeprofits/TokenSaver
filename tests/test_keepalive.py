@@ -20,8 +20,11 @@ UA = "claude-cli/2.1.287 (external, cli)"
 SENT = json.dumps({"model": "claude-opus-5-5", "max_tokens": 128000, "stream": True,
                    "thinking": {"type": "adaptive"},
                    "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
-                   "messages": [{"role": "user", "content": [{"type": "text", "text": "x",
+                   # 25 earlier turns: a session with some history (`ka.is_big`)
+                   "messages": [{"role": r, "content": "h"} for _ in range(25) for r in ("user", "assistant")]
+                   + [{"role": "user", "content": [{"type": "text", "text": "x",
                                  "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}]}).encode()
+SHORT = SENT.replace(b'"role": "assistant"', b'"role": "user"')     # no earlier replies
 USAGE = {"cache_read_input_tokens": 300_000, "cache_creation_input_tokens": 900,
          "cache_creation": {"ephemeral_1h_input_tokens": 900}}
 
@@ -167,6 +170,8 @@ class RememberTest(Base):
         self.assertNotIn("s", ka._SESSIONS, "a new 50K session is not big")
         self.remember()
         self.assertIn("s", ka._SESSIONS, "150K+ is big")
+        self.remember("q", sent=SHORT)
+        self.assertNotIn("q", ka._SESSIONS, "150K+ but no history yet: not held")
         self.remember("r", usage={"cache_read_input_tokens": 50_000}, t=time.time() - 2 * H)
         self.remember("r", usage={"cache_read_input_tokens": 50_000})
         self.assertIn("r", ka._SESSIONS, "returned to after a break: big")
@@ -423,6 +428,24 @@ class SettleTest(Base):
         config.set_value("cache_keepalive", "off", "user")
         ka.tick(is_open=lambda s: True)
         self.assertEqual(ka._SESSIONS, {})
+
+
+class BigTest(unittest.TestCase):
+    """Which sessions keep-alive may hold: a big context alone is not enough on a short
+    session (4 machines: under 20 requests, 28 bumps, none kept warm)."""
+
+    def test_rule(self):
+        self.assertFalse(ka.is_big(5, False, 300_000))
+        self.assertTrue(ka.is_big(20, False, 300_000))
+        self.assertFalse(ka.is_big(30, False, 100_000))
+        self.assertTrue(ka.is_big(50, False, 10_000))
+        self.assertTrue(ka.is_big(1, True, 10_000))
+
+    def test_turns_from_the_body(self):
+        body = json.dumps({"messages": [{"role": "user", "content": "a"},
+                                        {"role": "assistant", "content": "b"}] * 25}).encode()
+        self.assertEqual(ka._turns(body), 25)
+        self.assertEqual(ka._turns(body.replace(b'": "', b'":"')), 25)
 
 
 if __name__ == "__main__":

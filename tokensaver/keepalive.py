@@ -71,13 +71,17 @@ UPLOAD_BPS = 1_000_000       # assumed upload speed for that estimate, bytes/s (
 FREE_BUMPS = 2
 MAX_BUMPS = 6
 BIG_REQUESTS = 50            # "big": this many requests, returned to after a break before,
-BIG_TOKENS = 150_000         # or this much context (a session first seen after a restart)
+BIG_TOKENS = 150_000         # or this much context (a session first seen after a restart),
+MIN_TURNS = 20               # with at least this many turns: on 4 machines' benchmarks
+                             # (2026-11-17) sessions under 20 requests got 28 bumps, 0 kept warm
+                             # ($0.42 spent, nothing saved); 20-49 kept 2 of 6 (+$0.77 net)
 MIN_SAVING_USD = 0.01        # a warm return worth less than this is not worth a request
 # Claude Code compacts a session left idle once its context reaches this (setting
 # `idleCompaction`, default on; CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS, default 200K, never
 # below 100K). Seen here 54-59 min into a break, just before the cache would go: a bump
 # then keeps a cache nobody reads, so such sessions are not held at all.
 IDLE_COMPACT_TOKENS = 200_000
+
 IDLE_COMPACT_FLOOR = 100_000
 WARMUP_DAYS = 5              # past days of use before the day end is trusted
 WEEKDAY_MIN = 4              # same-weekday samples before that weekday's own day end is used
@@ -121,7 +125,20 @@ _TTL_1H = re.compile(rb'"ttl"\s*:\s*"1h"')
 _CC = re.compile(rb'"cache_control"')
 
 
+def is_big(turns: int, returned: bool, size: int) -> bool:
+    """Worth holding: a long session, one returned to after a break before, or a big one
+    with some history (a short big one, e.g. a one-off question on a large repo, ends)."""
+    return turns >= BIG_REQUESTS or returned or (size >= BIG_TOKENS and turns >= MIN_TURNS)
+
+
+def _turns(sent: bytes) -> int:
+    """Assistant turns in a sent body (cheap: no parse). A session resumed after a proxy
+    restart carries its history, so this counts what the proxy has not seen."""
+    return sent.count(b'"role":"assistant"') + sent.count(b'"role": "assistant"')
+
+
 # ---- the learned day end ---------------------------------------------------------
+
 
 def _day(t: float) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(t - DAY_CUTOFF_H * H))
@@ -498,7 +515,7 @@ def remember(session: str | None, path: str, sent: bytes | None, headers: dict, 
             if len(_COUNTS) > 500:
                 for k in sorted(_COUNTS, key=lambda k: _COUNTS[k]["last"] or 0)[:100]:
                     _COUNTS.pop(k, None)
-            big = c["reqs"] >= BIG_REQUESTS or c["returned"] or size >= BIG_TOKENS
+            big = is_big(max(c["reqs"], _turns(sent)), c["returned"], size)
             _WARM.pop(session, None)          # a real request: the proxy's own clock takes over
         if prev and prev.get("bumps"):
             read = int(usage.get("cache_read_input_tokens") or 0)

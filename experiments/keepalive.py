@@ -51,7 +51,7 @@ def main(proven: bool = True) -> int:
         for k, r in enumerate(rq):
             t = sim._ts(r.timestamp)
             g = sim._ts(rq[k + 1].timestamp) - t if k + 1 < len(rq) else None
-            big = k + 1 >= ka.BIG_REQUESTS or returned or r.context >= ka.BIG_TOKENS
+            big = ka.is_big(k + 1, returned, r.context)
             if g is not None and g > H:
                 returned = True
             if ttls[k] != "1h":

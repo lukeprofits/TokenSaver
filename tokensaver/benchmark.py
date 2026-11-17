@@ -799,7 +799,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
             cold = expired(k, gap, ours_ttls)
             if keepalive_ends is not None and k and ours_ttls[k - 1] == "1h":   # live: 1-hour caches only
                 # The break before this request: would keep-alive have kept the cache, and at what cost?
-                big = k >= ka.BIG_REQUESTS or returned or reqs[k - 1].context >= ka.BIG_TOKENS
+                big = ka.is_big(k, returned, reqs[k - 1].context)
                 warm_trim = decided is not None and decided[2] < decided[1] and decided[3] <= payback
                 t_prev = sim._ts(reqs[k - 1].timestamp)
                 ka_gap, new_history = gap, entry[2] != entries[k - 1][2]
@@ -902,7 +902,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         # After the session's last request: bumps for someone who never came back (as it runs
         # live while the session stays open; a /clear or /exit closed it, so none then).
         last = len(reqs) - 1
-        big = len(reqs) >= ka.BIG_REQUESTS or returned or reqs[last].context >= ka.BIG_TOKENS
+        big = ka.is_big(len(reqs), returned, reqs[last].context)
         n, _ = ka.replay_bumps(sim._ts(reqs[last].timestamp), None, big, keepalive_ends,
                               size=reqs[last].context)
         if n:
