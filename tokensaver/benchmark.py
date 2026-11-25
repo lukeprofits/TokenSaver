@@ -173,7 +173,7 @@ def _items(m: dict) -> list:
 
 def countable(messages: list, strict: dict | set | None = None) -> tuple[list, dict]:
     """(a copy count_tokens accepts, {"converted", "moved", "placeholder", "stray", "duplicate",
-    "empty", "merged"}). Every rule the counter has refused a history for is checked here
+    "empty", "merged", "trailing_thinking"}). Every rule the counter has refused a history for is checked here
     first, so a known problem never costs a refused count.
     `strict`: canonical-JSON hash of a message a 400 named -> level. 1: only basic block types
     and fields; 2: every block of it as text (its tool calls too, so their results become
@@ -258,6 +258,14 @@ def countable(messages: list, strict: dict | set | None = None) -> tuple[list, d
                                                   and b.get("tool_use_id") in have)]
         nxt["content"] = [have[t] for t in ids] + rest
         i += 1
+    # "The final block in an assistant message cannot be `thinking`" (a coworker's Sonnet
+    # 5.5 transcript, 2026-11-25: thinking after a parallel tool call). Trailing thinking
+    # is reasoning nothing follows from in this history, so it goes.
+    for m in out:
+        while m["role"] == "assistant" and m["content"] and isinstance(m["content"][-1], dict) \
+                and m["content"][-1].get("type") in ("thinking", "redacted_thinking"):
+            m["content"].pop()
+            rep["trailing_thinking"] = rep.get("trailing_thinking", 0) + 1
     # A message left empty by a move is not sent empty; `_src` (where each came from) is
     # kept aside for the caller.
     kept: list = []

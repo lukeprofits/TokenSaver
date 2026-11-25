@@ -176,6 +176,12 @@ def payload(raw: bytes, no_thinking: bool = False) -> dict | None:
     if no_thinking:
         from .background import strip_thinking
         out["messages"] = [strip_thinking(m) if isinstance(m, dict) else m for m in out["messages"]]
+        # And thinking off: with it on, the API can want the current tool loop's assistant turn
+        # to open with a thinking block, which was just removed. Likely cause (unconfirmed) of a
+        # coworker's Sonnet 5.5 audit turning off on its first count ("returned 400") while the
+        # benchmark, which sends no thinking setting, counted the same history fine. Both bodies
+        # of a pair get the same, so their difference is unchanged.
+        out.pop("thinking", None)
     if isinstance(out.get("tools"), list):
         out["tools"] = [t for t in out["tools"]
                         if isinstance(t, dict) and t.get("type") in (None, "custom")]
@@ -574,6 +580,8 @@ def _run(job: dict) -> None:
 
 def _on_error(code: int, headers: dict, job: dict) -> None:
     why = f"count_tokens returned {code or 'no response'}"
+    if code == 400 and _state.get("last_error"):
+        why += f" ({_state['last_error']})"     # the API's reason: field names and indexes, no content
     if code in (400, 401, 403):
         _state["disabled"] = why
     else:
