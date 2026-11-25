@@ -834,6 +834,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
     compacted_at = {start: sim._ts(ts) for start, ts in tinfo.get("boundaries") or [] if ts}
     reqs = [e[1] for e in entries]
     model = d.session.primary_model
+    # Script shortening only where the live proxy would do it (`passes.scripts_on`).
+    exclude = () if passes.scripts_on(model, config.get("script_shortening")) else ("heredocs",)
     prices = [pricing.price_for(r.model) or d.price for r in reqs]
     # Each request's cache lifetime, from what its usage says it wrote (`cachettl`): a request
     # reads the previous one's entry while the gap is within that entry's lifetime.
@@ -889,8 +891,8 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
         if applied is not None and cand["cut"] <= applied["cut"]:
             return None, "nothing new since the last trim"
         cand = dict(cand, tail_end=len(hist))
-        now = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off")
-        new = passes.rewrite_messages(bg.apply(hist, cand), aliases="off")
+        now = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off", exclude=exclude)
+        new = passes.rewrite_messages(bg.apply(hist, cand), aliases="off", exclude=exclude)
         n_now, n_new = _pair(lambda m: count(model, m), now, new, patient=True)
         if not (n_now and n_new):
             return None, "count failed"
@@ -978,7 +980,7 @@ def replay(d, count: Counter, step: int, after_s: float, payback: float, factor:
                 count.skipped_busy += 1           # the rate limit is saturated: interpolate this one
                 sample = False
             if sample or needed:
-                ours = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off")
+                ours = passes.rewrite_messages(bg.apply(hist, applied) if applied else hist, aliases="off", exclude=exclude)
         epochs.append(epoch)
         if ours is not None:
             g = removed(hist, ours, k)

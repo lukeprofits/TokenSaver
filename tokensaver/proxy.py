@@ -937,8 +937,19 @@ def pass_verdicts(now: float | None = None) -> tuple[str, ...]:
     return result
 
 
+def _exclude(st: dict) -> tuple:
+    """Passes this session leaves off: the measured verdicts, plus script
+    shortening when the session's model should not get it (`passes.scripts_on`).
+    A model switch already rebuilds the cache, and the ledger replays bytes sent
+    before any change, so this is safe to evaluate on every request."""
+    off = list(st.get("passes_off") or ())
+    if "heredocs" not in off and not passes.scripts_on(st.get("model"), config.get("script_shortening")):
+        off.append("heredocs")
+    return tuple(off)
+
+
 def _session_setup(session: str | None, messages: list | None = None,
-                   gap_s: float | None = None) -> tuple[object, tuple, dict]:
+                   gap_s: float | None = None, model: str | None = None) -> tuple[object, tuple, dict]:
     """(aliases argument, passes to exclude, stats) for this request, frozen
     between free points. `messages` is the history as Claude Code sent it.
 
@@ -951,7 +962,7 @@ def _session_setup(session: str | None, messages: list | None = None,
       the session's bytes, so it is not a free point.
     Never raises."""
     if not session:
-        return "off", (), {}
+        return "off", _exclude({"model": model}), {}
     try:
         with _STATE_LOCK:
             st = _bg_load(session)
@@ -976,15 +987,18 @@ def _session_setup(session: str | None, messages: list | None = None,
             if free:
                 st["passes_off"] = list(pass_verdicts())
                 st["passes_since"] = free
+            if model:
+                st["model"] = model
             st["aliases"], st["alias_last"] = a, time.time()
             _bg_save(session, st)
         arg = a.get("plan") if a.get("mode") == "plan" and a.get("plan") else "off"
         stats = {"aliases": a.get("mode")}
-        if st.get("passes_off"):
-            stats["passes_off"] = list(st["passes_off"])
-        return arg, tuple(st.get("passes_off") or ()), stats
+        off = _exclude(st)
+        if off:
+            stats["passes_off"] = list(off)
+        return arg, off, stats
     except Exception:
-        return "off", (), {}
+        return "off", ("heredocs",), {}
 
 
 # ---- automatic fallback --------------------------------------------------
@@ -1663,7 +1677,7 @@ def _decide(session: str, request: dict, original: list, cold: bool, headers: di
     compacted = background.apply(original, dict(pending, tail_end=len(original)))
     if compacted is None:
         return {"apply": False, "info": {"bg_skipped": "history changed since the compaction was made"}}
-    exclude = pass_verdicts()
+    exclude = _exclude({"passes_off": list(pass_verdicts()), "model": request.get("model")})
     plan = passes.hindsight_plan(compacted)
     tools = background.undefer(request.get("tools"),
                                background.loaded_tools(original[:int(pending["cut"])]))
@@ -1739,7 +1753,7 @@ def _rewrite(body: bytes | None, path: str, request_class: str | None,
                 return body, {}
             messages, stats = _bg_peek(messages, session)
             _keep_loaded(request, stats)
-            off = tuple(_bg_load(session).get("passes_off") or ())
+            off = _exclude(_bg_load(session))
             aliases = _aliases_peek(session)
             out = passes.rewrite_messages(messages, aliases=aliases, exclude=off)
             out, rinfo = _replay(session, messages, out, _epoch(stats.get("bg_cut"), stats.get("bg_made")),
@@ -1770,7 +1784,8 @@ def _rewrite(body: bytes | None, path: str, request_class: str | None,
         messages, stats = _bg(messages, session, skeleton, headers, decided=_decided)
         decide = stats.pop("bg_decide", None)
         _keep_loaded(request, stats)
-        alias_arg, exclude, astats = _session_setup(session, original, stats.get("gap_s"))
+        alias_arg, exclude, astats = _session_setup(session, original, stats.get("gap_s"),
+                                                   request.get("model"))
         stats.update(astats)
         out = passes.rewrite_messages(messages, aliases=alias_arg, exclude=exclude)
         raw_until = _last_assistant(messages) + 1 if adopt and not stats.get("bg_applied") else 0

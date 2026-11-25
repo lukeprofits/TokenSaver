@@ -149,7 +149,7 @@ and Anthropic. It doesn't use an AI model or an API key of its own.
 
 | what it does | typical saving |
 |---|---|
-| **Long scripts in commands.** When Claude runs a long inline script, the history keeps a short reference instead of the whole script (it already ran). The reference can't run, so if Claude ever copies it, it just fails | the biggest one on script-heavy work: ~5% of everything resent on this project's history |
+| **Long scripts in commands.** When Claude runs a long inline script, the history keeps a short reference instead of the whole script (it already ran). The reference can't run, so if Claude ever copies it, it just fails. Opus and newer only by default: a Sonnet session lost track of its own edits (`tokensaver config set script_shortening on|off` to change) | the biggest one on script-heavy work: ~5% of everything resent on this project's history |
 | **Duplicate plans.** Plan mode puts the same plan in the history twice; one copy is kept | ~3.5%, in sessions that use plan mode |
 | **JSON.** Compacts JSON output without losing anything | small for most people; a lot for JSON-heavy output |
 | **Clutter.** Removes color codes and trailing spaces | under 1% |

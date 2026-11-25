@@ -727,12 +727,12 @@ def main() -> int:
               f"verdict {off}")
         proxy._bg_save("sess-pv-old", {"passes_off": [], "hist_fp": None})
         h = dict(headers, **{"x-claude-code-session-id": "sess-pv-old"})
-        a1 = proxy._session_setup("sess-pv-old", body_obj["messages"], 30)
+        a1 = proxy._session_setup("sess-pv-old", body_obj["messages"], 30, "claude-opus-5-5")
         check("a session mid-cache keeps its passes (no free point)", a1[1] == (),
               "changing a cached session's bytes forces a full rebuild")
-        a2 = proxy._session_setup("sess-pv-old", body_obj["messages"], 2 * 3600)
+        a2 = proxy._session_setup("sess-pv-old", body_obj["messages"], 2 * 3600, "claude-opus-5-5")
         check("an expired cache adopts the verdict", "format" in a2[1], "the free rebuild is wasted")
-        a3 = proxy._session_setup("sess-pv-new", body_obj["messages"], None)
+        a3 = proxy._session_setup("sess-pv-new", body_obj["messages"], None, "claude-opus-5-5")
         check("a new session starts with the verdict", "format" in a3[1], "new sessions would pay the cost")
     finally:
         proxy._VERDICT.update(saved_verdict, at=0.0)
@@ -772,7 +772,7 @@ def main() -> int:
         proxy._VERDICT["at"] = 0.0
         try:
             check("vault unreadable: every pass on, no exception",
-                  proxy.pass_verdicts() == () and proxy._session_setup("s16b", hist, None)[1] == (),
+                  proxy.pass_verdicts() == () and proxy._session_setup("s16b", hist, None, "claude-opus-5-5")[1] == (),
                   "a broken vault must not break rewriting")
         finally:
             proxy.vault.DB_PATH = saved_db

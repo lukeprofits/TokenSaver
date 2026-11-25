@@ -305,6 +305,21 @@ HEREDOC_NOTE = ("[TokenSaver: a long inline script was left out of this history 
                 "written. The path shown cannot run. Write scripts inline as usual.]")
 
 
+# Which models get it. 2026-11-25: on a coworker's Sonnet 5.5 session Claude saw files change
+# that no command in its (shortened) history could have made, asked who was editing them, and
+# the developer uninstalled TokenSaver. No such reply in this machine's Opus sessions (Opus does
+# sometimes copy the short form; that fails loudly and costs one retry). So by default only Opus
+# and newer families get the pass; the `script_shortening` setting overrides it either way.
+SCRIPT_MODELS = ("opus", "fable")
+
+
+def scripts_on(model: str | None, setting: str = "auto") -> bool:
+    """Whether the heredocs pass runs for requests to `model` under `setting`."""
+    if setting in ("on", "off"):
+        return setting == "on"
+    return any(f in (model or "").lower() for f in SCRIPT_MODELS)
+
+
 def omit_heredocs(command: str) -> str | None:
     """The history form of `command` with each large quoted heredoc replaced by a
     reference that cannot run, or None if nothing qualifies. Deterministic."""

@@ -48,6 +48,9 @@ SPECS: dict[str, Spec] = {s.name: s for s in (
     Spec("bg_trim_pastes", None, bool, False,
          doc="in a break-time trim's old part, shorten giant pasted logs and data (200+ lines, machine "
              "output; never prose or code, never recent history)"),
+    Spec("script_shortening", None, str, "auto",
+         doc="auto | on | off: leave Claude's own long inline scripts out of the history it resends "
+             "(auto: Opus and newer only; smaller models were seen to lose track of their own edits)"),
     Spec("local_ai", None, str, "auto",
          doc="auto | on | off: local models for break-time trimming (auto: only if this machine passes the "
              "specs and disk checks; on: skip the disk check; off: never)"),
